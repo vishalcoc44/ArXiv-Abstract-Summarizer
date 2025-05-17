@@ -1,6 +1,6 @@
 import os
 import pickle
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, Response
 from llama_cpp import Llama
 # import google.generativeai as genai # No longer used for Gemini if using REST API
 import requests # For direct HTTP calls to Gemini API
@@ -12,6 +12,7 @@ import logging # For improved logging
 import sqlite3
 import datetime
 import colorama
+import json # Add this import at the top of the file if not already there
 
 colorama.init()
 
@@ -181,7 +182,9 @@ def init_db():
 def generate_gemini_response(prompt, chat_id=None):
     if not systems_status["gemini_model_configured"] or not AppConfig.GEMINI_API_KEY:
         logger.warning("Attempted to use Gemini model but API key is not configured.")
-        return "Gemini API is not configured. Cannot generate response."
+        # Return a generator that yields an error message
+        yield "Gemini API is not configured. Cannot generate response."
+        return
 
     headers = {
         "Content-Type": "application/json",
@@ -202,59 +205,78 @@ def generate_gemini_response(prompt, chat_id=None):
         # }
     }
     
-    api_url_with_key = f"{AppConfig.GEMINI_API_URL}?key={AppConfig.GEMINI_API_KEY}"
+    # Use streamGenerateContent endpoint
+    stream_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{AppConfig.GEMINI_MODEL_NAME}:streamGenerateContent?alt=sse&key={AppConfig.GEMINI_API_KEY}"
 
     try:
-        logger.info(f"Sending request to Gemini API: {AppConfig.GEMINI_API_URL} for prompt: '{prompt[:100]}...'")
-        response = requests.post(api_url_with_key, headers=headers, json=payload)
+        logger.info(f"Sending request to Gemini Stream API for prompt: '{prompt[:100]}...'")
+        response = requests.post(stream_api_url, headers=headers, json=payload, stream=True)
         response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
         
-        response_data = response.json()
+        client_sse_event_prefix = "data: " # SSE events are prefixed with "data: "
         
-        #logging.debug(f"Gemini API raw response: {response_data}") # For debugging
+        for line in response.iter_lines():
+            if line:
+                decoded_line = line.decode('utf-8')
+                if decoded_line.startswith(client_sse_event_prefix):
+                    json_str = decoded_line[len(client_sse_event_prefix):]
+                    try:
+                        chunk_data = json.loads(json_str)
+                        #logging.debug(f"Gemini API stream chunk: {chunk_data}") # For debugging
+                        if chunk_data.get("candidates") and \
+                           len(chunk_data["candidates"]) > 0 and \
+                           chunk_data["candidates"][0].get("content") and \
+                           chunk_data["candidates"][0]["content"].get("parts") and \
+                           len(chunk_data["candidates"][0]["content"]["parts"]) > 0 and \
+                           chunk_data["candidates"][0]["content"]["parts"][0].get("text"):
+                            
+                            generated_text_chunk = chunk_data["candidates"][0]["content"]["parts"][0]["text"]
+                            # logger.info(f"Yielding chunk: {generated_text_chunk}")
+                            yield generated_text_chunk
+                        elif chunk_data.get("promptFeedback") and \
+                             chunk_data["promptFeedback"].get("blockReason"):
+                            block_reason = chunk_data["promptFeedback"]["blockReason"]
+                            logger.error(f"Gemini API request blocked during stream. Reason: {block_reason}")
+                            error_detail = chunk_data["promptFeedback"].get("blockReasonMessage", "No additional details.")
+                            yield f"Sorry, your request was blocked by the Gemini API. Reason: {block_reason}. Details: {error_detail}"
+                            return # Stop generation if blocked
+                        # else:
+                            # logger.warning(f"Unexpected chunk structure or empty text: {chunk_data}")
+                            # Potentially yield nothing or a placeholder if needed
+                    except json.JSONDecodeError as json_err:
+                        logger.error(f"Error decoding JSON from Gemini stream: {json_err} on line: {json_str}")
+                        # Decide if we should yield an error or continue
+                    except Exception as e_chunk:
+                        logger.error(f"Error processing a chunk from Gemini stream: {e_chunk} - Chunk data: {chunk_data if 'chunk_data' in locals() else 'N/A'}")
 
-        # Extract text from the response
-        # The structure is typically response_data['candidates'][0]['content']['parts'][0]['text']
-        if response_data.get("candidates") and \
-           len(response_data["candidates"]) > 0 and \
-           response_data["candidates"][0].get("content") and \
-           response_data["candidates"][0]["content"].get("parts") and \
-           len(response_data["candidates"][0]["content"]["parts"]) > 0 and \
-           response_data["candidates"][0]["content"]["parts"][0].get("text"):
-            
-            generated_text = response_data["candidates"][0]["content"]["parts"][0]["text"]
-            logger.info("Gemini response generated successfully via REST API.")
-            return generated_text
-        elif response_data.get("promptFeedback") and \
-             response_data["promptFeedback"].get("blockReason"):
-            block_reason = response_data["promptFeedback"]["blockReason"]
-            logger.error(f"Gemini API request blocked. Reason: {block_reason}")
-            error_detail = response_data["promptFeedback"].get("blockReasonMessage", "No additional details.")
-            return f"Sorry, your request was blocked by the Gemini API. Reason: {block_reason}. Details: {error_detail}"
-        else:
-            logger.error(f"Could not extract text from Gemini API response. Response: {response_data}")
-            return "Sorry, I received an unexpected response structure from the Gemini service."
+        logger.info("Gemini stream finished.")
 
     except requests.exceptions.HTTPError as http_err:
         logger.error(f"HTTP error occurred with Gemini API: {http_err} - Response: {http_err.response.text}", exc_info=True)
-        error_content = http_err.response.json() if http_err.response.content else {}
+        error_content = {}
+        try:
+            error_content = http_err.response.json() if http_err.response and http_err.response.content else {}
+        except json.JSONDecodeError:
+            logger.error("Could not decode JSON from HTTP error response.")
         error_message = error_content.get("error", {}).get("message", "An HTTP error occurred.")
-        return f"Sorry, I encountered an HTTP error connecting to the Gemini service: {error_message}"
+        yield f"Sorry, I encountered an HTTP error connecting to the Gemini service: {error_message}"
     except requests.exceptions.RequestException as req_err:
         logger.error(f"Error sending request to Gemini API: {req_err}", exc_info=True)
-        return "Sorry, I encountered an error sending the request to the Gemini service."
+        yield "Sorry, I encountered an error sending the request to the Gemini service."
     except Exception as e:
         logger.error(f"Error processing Gemini response: {e}", exc_info=True)
-        return "Sorry, I encountered an unexpected error trying to connect to the Gemini service."
+        yield "Sorry, I encountered an unexpected error trying to connect to the Gemini service."
 
 # UNCOMMENTED generate_local_rag_response
 def generate_local_rag_response(user_query, chat_id=None):
     if not systems_status["local_llm_loaded"]:
         logger.warning("Attempted to use local model for RAG, but it's not loaded.")
-        return "Local model is not loaded. Cannot generate RAG response."
+        yield "Local model is not loaded. Cannot generate RAG response."
+        return
     if not systems_status["faiss_index_loaded"]:
         logger.warning("Attempted to use RAG, but FAISS index is not loaded.")
-        return "RAG components (FAISS index) are not available. Cannot generate RAG response."
+        yield "RAG components (FAISS index) are not available. Cannot generate RAG response."
+        return
 
     try:
         logger.info(f"Searching FAISS index for: '{user_query}'")
@@ -278,20 +300,32 @@ Assistant Answer:"""
         
         logger.debug(f"Prompt for local LLM (GGUF):\n{prompt}")
 
-        output = local_llm(
+        output_stream = local_llm(
             prompt,
             max_tokens=512, 
             stop=["User Question:", "User:", "\n\n"],
-            echo=False
+            echo=False,
+            stream=True  # Enable streaming for llama-cpp-python
         )
         
-        response_text = output['choices'][0]['text'].strip()
-        logger.info(f"Generated local RAG response: '{response_text[:100]}...'")
-        return response_text
+        logger.info("Local LLM (GGUF) stream started...")
+        full_response_for_log = []
+        for output_chunk in output_stream:
+            # logging.debug(f"Local LLM chunk: {output_chunk}") # For debugging
+            if 'choices' in output_chunk and len(output_chunk['choices']) > 0:
+                chunk_text = output_chunk['choices'][0].get('text', '')
+                if chunk_text:
+                    # logger.info(f"Yielding local LLM chunk: {chunk_text}")
+                    full_response_for_log.append(chunk_text)
+                    yield chunk_text
+        
+        logger.info(f"Generated local RAG response (streamed): '{''.join(full_response_for_log)[:100]}...'")
+        # No single return value needed here as we are yielding
 
     except Exception as e:
         logger.error(f"Error during RAG generation with local model: {e}", exc_info=True)
-        return "Sorry, I encountered an error generating a response with the local model and RAG."
+        yield "Sorry, I encountered an error generating a response with the local model and RAG."
+        return
 
 # --- Flask Routes ---
 @app.route('/')
@@ -484,57 +518,113 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
         return jsonify({"error": "Invalid JSON payload"}), 400
 
     user_message_content = data.get('message')
-    model_type = data.get('model_type', 'gemini')
+    if not user_message_content:
+        return jsonify({"error": "Message content is required"}), 400
+
     chat_id = data.get('chat_id')
+    model_choice = data.get('model_type', 'gemma') # Default to gemma if not specified
 
-    if not user_message_content or not chat_id:
-        return jsonify({"error": "Message and chat_id are required"}), 400
-
-    logger.info(f"Chat ID: {chat_id}, Model: {model_type}, Message: '{user_message_content[:50]}...'")
-    
     conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database connection failed"}), 500
+
     try:
+        if chat_id:
+            # Verify chat_id exists and belongs to user (simplified: just check existence)
+            chat = conn.execute("SELECT id FROM chats WHERE id = ?", (chat_id,)).fetchone()
+            if not chat:
+                # If chat_id is provided but not found, create a new one.
+                # This could be an alternative to erroring out, depending on desired UX.
+                # For now, let's assume we'd rather create a new chat if a bogus ID is passed.
+                # Or, more strictly, return an error:
+                # conn.close()
+                # return jsonify({"error": "Chat not found"}), 404
+                # Decided: for robustness, if an invalid chat_id comes, make a new chat.
+                chat_id = None 
+                
+        if not chat_id:
+            # Create new chat
+            cursor = conn.execute("INSERT INTO chats (user_id, folder_id) VALUES (?, ?)", (1, None)) # Assuming user_id 1, no folder
+            conn.commit()
+            chat_id = cursor.lastrowid
+            logger.info(f"Created new chat with ID: {chat_id}")
+
         # Store user message
         conn.execute(
             "INSERT INTO messages (chat_id, sender, content) VALUES (?, ?, ?)",
             (chat_id, 'user', user_message_content)
         )
         conn.commit()
+        logger.info(f"Stored user message for chat_id {chat_id}")
 
-        # Generate bot response
-        bot_response_content = ""
-        if model_type == 'gemma': # Check script2.js for the model name sent
-            bot_response_content = generate_local_rag_response(user_message_content, chat_id)
-        elif model_type == 'gemini':
-            bot_response_content = generate_gemini_response(user_message_content, chat_id)
+        response_generator = None
+        if model_choice == 'gemma':
+            logger.info(f"Using Gemma (local Llama) for chat_id {chat_id}")
+            response_generator = generate_local_rag_response(user_message_content, chat_id)
+        elif model_choice == 'gemini':
+            logger.info(f"Using Gemini API for chat_id {chat_id}")
+            response_generator = generate_gemini_response(user_message_content, chat_id)
         else:
-            return jsonify({"error": f"Invalid model_type: {model_type}"}), 400
+            # conn.close() # Already in finally
+            return jsonify({"error": "Invalid model choice"}), 400
 
-        # Store bot message
-        conn.execute(
-            "INSERT INTO messages (chat_id, sender, content) VALUES (?, ?, ?)",
-            (chat_id, 'bot', bot_response_content)
-        )
+        if response_generator is None:
+            # This case should ideally be handled by the model functions returning an error yield
+            logger.error(f"Response generator was None for model {model_choice}, chat_id {chat_id}")
+            # conn.close() # Already in finally
+            return jsonify({"error": "Failed to get response from model"}), 500
         
-        # Update chat's last_snippet and updated_at
-        snippet = (user_message_content[:30] + "...") if len(user_message_content) > 30 else user_message_content
-        conn.execute(
-            "UPDATE chats SET last_snippet = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (snippet, chat_id)
-        )
-        conn.commit()
-
-        return jsonify({"response": bot_response_content, "chat_id": chat_id})
+        full_bot_response_parts = []
+        def stream_and_collect():
+            nonlocal full_bot_response_parts
+            db_conn_for_stream = None # Use a separate connection for this generator's scope
+            try:
+                for chunk in response_generator:
+                    full_bot_response_parts.append(chunk)
+                    yield chunk 
+            finally:
+                # This block executes after the generator is exhausted or closed.
+                logger.info(f"Stream to client finished for chat_id {chat_id}. Saving full bot response to DB.")
+                bot_response_content = "".join(full_bot_response_parts)
+                if bot_response_content: # Only save if there's content
+                    try:
+                        db_conn_for_stream = get_db_connection()
+                        # Store bot message
+                        db_conn_for_stream.execute(
+                            "INSERT INTO messages (chat_id, sender, content) VALUES (?, ?, ?)",
+                            (chat_id, 'bot', bot_response_content)
+                        )
+                        
+                        # Update chat's last_snippet and updated_at
+                        # Use user message for snippet, as per original logic.
+                        snippet = (user_message_content[:30] + "...") if len(user_message_content) > 30 else user_message_content
+                        db_conn_for_stream.execute(
+                            "UPDATE chats SET last_snippet = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (snippet, chat_id)
+                        )
+                        db_conn_for_stream.commit()
+                        logger.info(f"Bot response and chat snippet for chat_id {chat_id} saved to DB.")
+                    except sqlite3.Error as e_db:
+                        logger.error(f"Database error while saving streamed bot response for chat_id {chat_id}: {e_db}", exc_info=True)
+                    finally:
+                        if db_conn_for_stream:
+                            db_conn_for_stream.close()
+                else:
+                    logger.info(f"No bot response content generated for chat_id {chat_id}, not saving to DB.")
+        
+        # Stream to client. The stream_and_collect generator will handle DB ops in its finally block.
+        return Response(stream_and_collect(), mimetype='text/plain') 
 
     except sqlite3.Error as e:
-        logger.error(f"Database error in /api/chat: {e}", exc_info=True)
+        logger.error(f"Database error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e}", exc_info=True)
         return jsonify({"error": "Database operation failed"}), 500
     except Exception as e:
-        logger.error(f"Unexpected error in /api/chat: {e}", exc_info=True)
+        logger.error(f"Unexpected error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e}", exc_info=True)
         return jsonify({"error": "An unexpected server error occurred."}), 500
     finally:
         if conn:
             conn.close()
+            logger.debug(f"Closed main DB connection for /api/chat request (chat_id: {chat_id if 'chat_id' in locals() else 'unknown'}).")
 
 @app.route('/api/folders/<int:folder_id>', methods=['DELETE'])
 def delete_folder(folder_id):

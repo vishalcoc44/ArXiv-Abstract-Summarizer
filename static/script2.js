@@ -187,7 +187,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const newChatButton = document.querySelector('.new-chat-btn');
     const addFolderButton = document.getElementById('add-folder-btn');
     const foldersListUL = document.getElementById('folders-list');
-    const uncategorizedChatsListUL = document.getElementById('uncategorized-chats-list');
+    const directChatsListUL = document.getElementById('direct-chats-list');
 
     // Modal elements
     const inputModal = document.getElementById('inputModal');
@@ -406,7 +406,12 @@ document.addEventListener('DOMContentLoaded', () => {
             gsap.to(chatOutput, { opacity: 1, duration: 0.1, delay: 0.2 }); 
         }
 
-        const thinkingLottieContainerWrapper = appendLottieThinkingMessage();
+        // Create a placeholder message for the bot's response that will be updated with stream.
+        const botMessageWrapper = appendMessage('', 'bot-message', true); // true for isThinking initially
+        const botMessageParagraph = botMessageWrapper.querySelector('p');
+        const thinkingDots = botMessageWrapper.querySelector('.thinking-dots');
+        if(thinkingDots) thinkingDots.style.display = 'inline'; // Show thinking dots
+        if(botMessageParagraph) botMessageParagraph.innerHTML = ''; // Clear any default thinking text
 
         const payload = {
             message: messageText,
@@ -430,45 +435,85 @@ document.addEventListener('DOMContentLoaded', () => {
         })
         .then(response => {
             if (!response.ok) {
-                return response.json().then(err => {
-                    throw new Error(err.error || `HTTP error! Status: ${response.status}`);
-                }).catch(() => {
-                    throw new Error(`HTTP error! Status: ${response.status}, Body: ${response.statusText}`);
+                // Attempt to read error body as JSON, then text, then throw generic error
+                return response.json()
+                    .then(err => { throw new Error(err.error || `HTTP error! Status: ${response.status}`); })
+                    .catch(() => response.text().then(textErr => { throw new Error(textErr || `HTTP error! Status: ${response.status}`); }));
+            }
+            
+            // Handle streaming response
+            if (!response.body) {
+                throw new Error('ReadableStream not available.');
+            }
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let accumulatedText = '';
+            let firstChunkReceived = false;
+
+            function push() {
+                reader.read().then(({ done, value }) => {
+                    if (done) {
+                        console.log('Stream complete');
+                        if(thinkingDots) thinkingDots.style.display = 'none';
+                        // Final update to sidebar after stream is complete
+                        fetchAndRenderSidebarData(false);
+                        // Re-enable send button and set icon
+                        if (sendButtonIconContainer) {
+                            sendButtonIconContainer.innerHTML = '<i class="fas fa-paper-plane"></i>'; 
+                        }
+                        sendButton.disabled = false;
+                        userInput.focus();
+                        return;
+                    }
+
+                    if (!firstChunkReceived) {
+                        if(thinkingDots) thinkingDots.style.display = 'none'; // Hide thinking dots
+                        // Remove the initial thinking state from the bot message wrapper if it had one
+                        botMessageWrapper.classList.remove('bot-thinking');
+                        firstChunkReceived = true;
+                    }
+
+                    const chunkText = decoder.decode(value, { stream: true });
+                    accumulatedText += chunkText;
+                    
+                    // Safely parse and update HTML. `safeMarkdownParse` is assumed to handle partial HTML well enough or just update text.
+                    // For a smoother animation, the `animateTextByWord` would need significant changes to support appending.
+                    // For now, direct update:
+                    if (botMessageParagraph) {
+                        // If using marked.js, it needs full content to parse correctly.
+                        // So, we update with the full accumulated text each time.
+                        botMessageParagraph.innerHTML = safeMarkdownParse(accumulatedText);
+                    }
+                    chatViewContainer.scrollTop = chatViewContainer.scrollHeight;
+                    push(); // Read the next chunk
+                }).catch(error => {
+                    console.error('Error reading stream:', error);
+                    if(thinkingDots) thinkingDots.style.display = 'none';
+                    if (botMessageParagraph) botMessageParagraph.innerHTML += `<br><span class="error-text">Stream error: ${error.message}</span>`;
+                    // Re-enable send button and set icon on error too
+                    if (sendButtonIconContainer) {
+                        sendButtonIconContainer.innerHTML = '<i class="fas fa-paper-plane"></i>'; 
+                    }
+                    sendButton.disabled = false;
+                    userInput.focus();
                 });
             }
-            return response.json();
-        })
-        .then(data => {
-            if (thinkingLottieContainerWrapper) {
-                removeLottieThinkingMessage(thinkingLottieContainerWrapper);
-            }
-            if (data && typeof data.response === 'string') {
-                appendMessage(data.response, 'bot-message');
-                if (data.chat_id && data.chat_id === currentActiveChatId) {
-                    // If backend confirms chat_id and potentially updates snippet, refresh sidebar for that chat
-                    fetchAndRenderSidebarData(false); // silent=false to re-render, but could be optimized
-                }
-            } else if (data && data.response) {
-                appendMessage(String(data.response), 'bot-message');
-            } else {
-                appendMessage('Error: Received an invalid response from the server.', 'bot-message');
-            }
+            push(); // Start reading the stream
         })
         .catch(error => {
-            console.error('Fetch error:', error);
-            if (thinkingLottieContainerWrapper) {
-                removeLottieThinkingMessage(thinkingLottieContainerWrapper);
-            }
-            appendMessage(`Error: ${error.message}`, 'bot-message');
-        })
-        .finally(() => {
-            // Revert send button to idle state (FontAwesome)
+            console.error('Fetch error in proceedWithSending:', error);
+            if(thinkingDots) thinkingDots.style.display = 'none'; // Hide dots on error
+            // Update the placeholder message with error
+            if (botMessageParagraph) botMessageParagraph.innerHTML = `<span class="error-text">Error: ${error.message}</span>`;
+            botMessageWrapper.classList.remove('bot-thinking');
+            // Re-enable send button and set icon
             if (sendButtonIconContainer) {
                 sendButtonIconContainer.innerHTML = '<i class="fas fa-paper-plane"></i>';
             }
-            sendButton.disabled = false; // Re-enable button
+            sendButton.disabled = false;
             userInput.focus(); // Focus back on input
         });
+        // Note: The .finally block from the original code is effectively handled by the stream completion or error handling
     }
 
     function appendLottieThinkingMessage() {
@@ -561,7 +606,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const messageParagraph = document.createElement('p');
         let animationTimeline = null; 
 
-        if (type === 'bot-message' && !isThinking) {
+        if (isThinking && type === 'bot-message') { // For initial placeholder before stream
+             const dotsContainer = document.createElement('span');
+             dotsContainer.classList.add('thinking-dots');
+             dotsContainer.innerHTML = '<span>.</span><span>.</span><span>.</span>';
+             dotsContainer.style.display = 'none'; // Initially hidden, shown by proceedWithSending
+             messageParagraph.appendChild(dotsContainer);
+        } else if (type === 'bot-message' && !isThinking) { // For non-streamed or post-stream finalization
             const textToParse = (typeof text === 'string' || text instanceof String) ? text : '';
             let htmlOutput = '';
             try {
@@ -571,12 +622,50 @@ document.addEventListener('DOMContentLoaded', () => {
                 htmlOutput = safeMarkdownParse(textToParse);
             }
             animationTimeline = animateTextByWord(messageParagraph, htmlOutput);
+
+            // Add copy button for bot messages
+            const copyButton = document.createElement('button');
+            copyButton.classList.add('icon-btn', 'copy-btn');
+            copyButton.title = 'Copy message';
+            copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+            copyButton.addEventListener('click', () => {
+                // Fallback for http connections or older browsers
+                const rawText = messageParagraph.innerText || messageParagraph.textContent || '';
+                navigator.clipboard.writeText(rawText).then(() => {
+                    copyButton.innerHTML = '<i class="fas fa-check"></i>';
+                    setTimeout(() => {
+                        copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+                    }, 2000);
+                }).catch(err => {
+                    console.error('Failed to copy text: ', err);
+                    // Basic fallback for HTTP or if clipboard API fails
+                    try {
+                        const textArea = document.createElement("textarea");
+                        textArea.value = rawText;
+                        document.body.appendChild(textArea);
+                        textArea.focus();
+                        textArea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textArea);
+                        copyButton.innerHTML = '<i class="fas fa-check"></i>';
+                        setTimeout(() => {
+                            copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+                        }, 2000);
+                    } catch (execErr) {
+                        console.error('Fallback copy failed: ', execErr);
+                        alert('Failed to copy message. Please copy manually.');
+                    }
+                });
+            });
+            messageContentDiv.appendChild(copyButton); // Add it before the paragraph for positioning ease
+
         } else if (isThinking && !messageWrapper.classList.contains('bot-thinking-lottie')) { 
             messageParagraph.textContent = text; 
             if (messageWrapper.classList.contains('bot-thinking')) { 
                 const dotsContainer = document.createElement('span');
                 dotsContainer.classList.add('thinking-dots');
                 dotsContainer.innerHTML = '<span>.</span><span>.</span><span>.</span>';
+                dotsContainer.style.display = 'none'; // Initially hidden, shown by proceedWithSending
                 messageParagraph.appendChild(dotsContainer);
             }
         } else if (type === 'user-message') { 
@@ -673,22 +762,17 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
             const data = await response.json();
 
-            // Store folders globally for use in move modal, or pass data.folders around
-            // For simplicity, let's assume we can refetch or it's up-to-date enough
-            // when the modal is opened by re-using `data.folders` if `fetchAndRenderSidebarData` is called prior to modal opening.
-            // A more robust solution might involve a dedicated function to get folders.
             window.currentFoldersData = data.folders || [];
 
             renderFolders(data.folders || [], animate);
-            renderUncategorizedChats(data.uncategorized_chats || [], animate);
+            renderDirectChats(data.uncategorized_chats || [], animate);
 
-            // Re-attach click listeners for section toggles as content is new
             attachSectionToggleListeners(); 
 
         } catch (error) {
             console.error("Failed to fetch sidebar data:", error);
             if (foldersListUL) foldersListUL.innerHTML = '<li>Error loading folders.</li>';
-            if (uncategorizedChatsListUL) uncategorizedChatsListUL.innerHTML = '<li>Error loading chats.</li>';
+            if (directChatsListUL) directChatsListUL.innerHTML = '<li>Error loading chats.</li>';
         }
     }
 
@@ -828,11 +912,11 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function renderUncategorizedChats(chats, animate) {
-        if (!uncategorizedChatsListUL) return;
-        uncategorizedChatsListUL.innerHTML = ''; // Clear existing
+    function renderDirectChats(chats, animate) {
+        if (!directChatsListUL) return;
+        directChatsListUL.innerHTML = ''; // Clear existing
         if (chats.length === 0) {
-             uncategorizedChatsListUL.innerHTML = '<li class="empty-state-sidebar">No uncategorized chats.</li>';
+             directChatsListUL.innerHTML = '<li class="empty-state-sidebar">No chats.</li>';
         }
         chats.forEach(chat => {
             const chatLi = document.createElement('li');
@@ -881,7 +965,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
 
-            uncategorizedChatsListUL.appendChild(chatLi);
+            directChatsListUL.appendChild(chatLi);
 
             const lottieIcon = chatLi.querySelector('.lottie-sidebar-icon');
             if(lottieIcon) {
@@ -1347,23 +1431,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const toggleButtonElement = mainContentSidebarToggleBtn.closest('.icon-btn'); 
         if (toggleButtonElement) {
             toggleButtonElement.addEventListener('click', () => {
-                sidebar.classList.toggle('collapsed');
-                const isSidebarCollapsed = sidebar.classList.contains('collapsed');
-                gsap.to(sidebar, { 
-                    width: isSidebarCollapsed ? 0 : 'var(--sidebar-width)', 
-                    padding: isSidebarCollapsed ? '0px' : '16px',
-                    opacity: isSidebarCollapsed ? 0 : 1,
-                    duration: 0.5, 
-                    ease: 'expo.inOut' 
-                });
-                if (mainContentSidebarToggleBtn) {
-                    if (isSidebarCollapsed) {
-                        mainContentSidebarToggleBtn.classList.remove('fa-chevron-left');
-                        mainContentSidebarToggleBtn.classList.add('fa-bars');
-                    } else {
-                        mainContentSidebarToggleBtn.classList.remove('fa-bars');
-                        mainContentSidebarToggleBtn.classList.add('fa-chevron-left');
-                    }
+                clearTimeout(autoCloseTimer); // Clear any pending auto-close
+                if (sidebar.classList.contains('collapsed')) {
+                    openSidebar();
+                } else {
+                    closeSidebar();
                 }
             });
         }
@@ -1372,6 +1444,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // Model Selection Button Logic
     const gemmaBtn = document.getElementById('gemma-btn');
     const geminiBtn = document.getElementById('gemini-btn');
+    const themeToggleBtn = document.getElementById('theme-toggle-btn');
+    const appLayout = document.querySelector('.app-layout'); // Target for theme class
+
     if (gemmaBtn && geminiBtn) {
         gemmaBtn.addEventListener('click', () => {
             if (currentModel !== 'gemma') {
@@ -1507,5 +1582,130 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
     }
+
+    const sidebarHoverTrigger = document.querySelector('.sidebar-hover-trigger');
+    let autoCloseTimer = null;
+    const SIDEBAR_AUTO_CLOSE_DELAY = 100; // milliseconds
+    let isMouseInsideSidebar = false;
+
+    // --- Sidebar Open/Close Functions ---
+    function openSidebar(isTriggeredByHover = false) {
+        if (!sidebar.classList.contains('collapsed')) return; // Already open
+
+        sidebar.classList.remove('collapsed');
+        if (sidebarHoverTrigger) sidebarHoverTrigger.style.display = 'none';
+
+        gsap.to(sidebar, { 
+            width: 'var(--sidebar-width)', 
+            padding: '16px', // Ensure original padding is restored
+            opacity: 1,
+            duration: 0.4, 
+            ease: 'power2.out' 
+        });
+        if (mainContentSidebarToggleBtn) {
+            mainContentSidebarToggleBtn.classList.remove('fa-bars');
+            mainContentSidebarToggleBtn.classList.add('fa-chevron-left');
+        }
+        // If opened by hover, set flag to allow auto-close on mouseleave
+        // if (isTriggeredByHover) { // This might not be needed if logic is clean
+        // }
+    }
+
+    function closeSidebar(isTriggeredByHover = false) {
+        if (sidebar.classList.contains('collapsed')) return; // Already collapsed
+        
+        // Do not close if mouse is flagged as inside (e.g. quickly moved out and back in)
+        // This check is a bit redundant if the mouseenter on sidebar clears the timer properly.
+        // if (isTriggeredByHover && isMouseInsideSidebar) return; 
+
+        sidebar.classList.add('collapsed');
+        if (sidebarHoverTrigger) sidebarHoverTrigger.style.display = 'block';
+
+        gsap.to(sidebar, { 
+            width: 0, 
+            padding: '0px', 
+            opacity: 0,
+            duration: 0.4, 
+            ease: 'power2.inOut' 
+        });
+        if (mainContentSidebarToggleBtn) {
+            mainContentSidebarToggleBtn.classList.remove('fa-chevron-left');
+            mainContentSidebarToggleBtn.classList.add('fa-bars');
+        }
+    }
+
+    // --- New Hover Logic ---
+    if (sidebar) {
+        sidebar.addEventListener('mouseenter', () => {
+            isMouseInsideSidebar = true;
+            clearTimeout(autoCloseTimer); // Cancel auto-close if mouse re-enters
+        });
+
+        sidebar.addEventListener('mouseleave', () => {
+            isMouseInsideSidebar = false;
+            // Only start auto-close timer if sidebar is NOT collapsed (i.e., it's open)
+            if (!sidebar.classList.contains('collapsed')) {
+                autoCloseTimer = setTimeout(() => {
+                    // Check again if mouse isn't back inside before closing
+                    if (!isMouseInsideSidebar) {
+                        closeSidebar(true);
+                    }
+                }, SIDEBAR_AUTO_CLOSE_DELAY);
+            }
+        });
+    }
+
+    if (sidebarHoverTrigger) {
+        sidebarHoverTrigger.addEventListener('mouseenter', () => {
+            if (sidebar.classList.contains('collapsed')) {
+                openSidebar(true);
+            }
+        });
+        // No mouseleave needed for the trigger itself, as sidebar's mouseleave handles closure.
+    }
+
+    // Initial state for hover trigger based on sidebar state
+    if (sidebar && sidebarHoverTrigger) {
+        if (sidebar.classList.contains('collapsed')) {
+            sidebarHoverTrigger.style.display = 'block';
+        } else {
+            sidebarHoverTrigger.style.display = 'none';
+        }
+    }
+
+    // --- Theme Toggle Logic ---
+    function applyTheme(theme) {
+        if (!appLayout || !themeToggleBtn) return;
+        const icon = themeToggleBtn.querySelector('i');
+        if (theme === 'light') {
+            appLayout.classList.add('light-mode');
+            if (icon) {
+                icon.classList.remove('fa-moon');
+                icon.classList.add('fa-sun');
+            }
+            localStorage.setItem('theme', 'light');
+        } else {
+            appLayout.classList.remove('light-mode');
+            if (icon) {
+                icon.classList.remove('fa-sun');
+                icon.classList.add('fa-moon');
+            }
+            localStorage.setItem('theme', 'dark');
+        }
+    }
+
+    if (themeToggleBtn) {
+        themeToggleBtn.addEventListener('click', () => {
+            if (appLayout.classList.contains('light-mode')) {
+                applyTheme('dark');
+            } else {
+                applyTheme('light');
+            }
+        });
+    }
+
+    // Load saved theme on page load
+    const savedTheme = localStorage.getItem('theme') || 'dark'; // Default to dark
+    applyTheme(savedTheme);
 
 });

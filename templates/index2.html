@@ -16,6 +16,8 @@
 </head>
 <body>
     <div class="app-layout">
+        <!-- Hover trigger for collapsed sidebar -->
+        <div class="sidebar-hover-trigger"></div>
         <!-- Sidebar -->
         <aside class="sidebar">
             <div class="sidebar-header">
@@ -23,7 +25,12 @@
                     <i class="fas fa-brain app-icon"></i> <!-- App Logo/Icon -->
                     <span>My Chats</span>
                 </div>
-                <button class="sidebar-toggle-btn"><i class="fas fa-sliders-h"></i></button>
+                <div class="header-actions-container">
+                    <button id="theme-toggle-btn" class="icon-btn" title="Toggle theme">
+                        <i class="fas fa-sun"></i>
+                    </button>
+                    <button class="sidebar-toggle-btn"><i class="fas fa-sliders-h"></i></button>
+                </div>
             </div>
             <div class="search-bar">
                 <i class="fas fa-search search-icon"></i>
@@ -42,23 +49,12 @@
                         <!-- Dynamic folders will be populated here -->
                     </ul>
                 </div>
-                <div class="nav-section">
+                <div class="nav-section" id="direct-chats-section">
                     <div class="nav-section-header">
                         <span>Chats</span>
-                        <button class="icon-btn" data-section-toggle="chats-list"><i class="fas fa-chevron-down"></i></button>
+                        <button class="icon-btn" data-section-toggle="direct-chats-list"><i class="fas fa-chevron-down"></i></button>
                     </div>
-                    <ul id="chats-list">
-                        <!-- Dynamic chats (categorized) were originally here, but now all chats will be under folders or uncategorized -->
-                        <!-- This specific UL might be redundant if all chats are strictly within folders or a separate 'uncategorized' list -->
-                        <!-- For now, let's keep it but expect it to be empty or repurposed if chats are only shown within folders or a separate 'uncategorized' list -->
-                    </ul>
-                </div>
-                <div class="nav-section" id="uncategorized-chats-section">
-                    <div class="nav-section-header">
-                        <span>Uncategorized Chats</span>
-                        <button class="icon-btn" data-section-toggle="uncategorized-chats-list"><i class="fas fa-chevron-down"></i></button>
-                    </div>
-                    <ul id="uncategorized-chats-list">
+                    <ul id="direct-chats-list">
                         <!-- Dynamic uncategorized chats will be populated here -->
                     </ul>
                 </div>

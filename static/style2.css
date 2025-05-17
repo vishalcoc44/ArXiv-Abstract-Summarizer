@@ -16,6 +16,22 @@
     --border-radius-chat-bubble: 20px; /* Specific for chat bubbles */
     --border-radius-pill: 25px; /* For pill-shaped buttons like filters */
     --font-family-main: 'Inter', sans-serif;
+    --lottie-thinking-dot-color: var(--text-secondary); /* Default for dark mode */
+}
+
+/* --- Light Mode Theme Variables & Overrides --- */
+.light-mode {
+    --bg-primary: #f0f2f5;       /* Light grey - main background */
+    --bg-secondary: #ffffff;     /* White - sidebar, cards */
+    --bg-tertiary: #e9ecef;      /* Lighter grey - input fields, hover */
+    /* --bg-accent is kept from :root by default, can be overridden if needed for light bg */
+    /* --bg-accent: #0d8a67; */ 
+    --text-primary: #181c20;     /* Dark grey/black - main text */
+    --text-secondary: #495057;   /* Medium grey - softer text */
+    --text-muted: #6c757d;       /* Light grey - muted text */
+    --border-color: #d1d5db;     /* Slightly adjusted light grey border for better visibility */
+
+    --lottie-thinking-dot-color: #555b61; /* var(--text-secondary) in light mode for dots */
 }
 
 * {
@@ -67,6 +83,13 @@ body {
     justify-content: space-between;
     align-items: center;
     margin-bottom: 20px;
+}
+
+/* Container for buttons in the sidebar header */
+.header-actions-container {
+    display: flex;
+    align-items: center;
+    gap: 8px; /* Adjust gap between buttons as needed */
 }
 
 .app-logo-title {
@@ -524,13 +547,42 @@ body {
     /* border-bottom-left-radius: 4px; REMOVE - use consistent chat bubble radius */
 }
 
+/* Copy button for bot messages */
+.bot-message .message-content {
+    position: relative; /* For positioning the copy button */
+}
+
+.copy-btn {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    padding: 4px 6px; /* Smaller padding */
+    font-size: 0.8em; /* Smaller icon */
+    background-color: rgba(255, 255, 255, 0.1); /* Subtle background */
+    border-radius: 4px;
+    opacity: 0.6;
+    transition: opacity 0.2s ease, background-color 0.2s ease;
+}
+
+.bot-message .message-content:hover .copy-btn {
+    opacity: 1;
+}
+
+.copy-btn:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+.copy-btn i {
+    color: var(--text-primary);
+}
+
 /* Thinking dots inside bot message */
 .bot-message .thinking-dots span {
     display: inline-block;
-    opacity: 0.5; /* Dark theme adjustment */
+    /* opacity: 0.5; REMOVED - Rely on color variable */
     margin: 0 1px;
     animation: blink 1.4s infinite both;
-    color: var(--text-secondary);
+    color: var(--lottie-thinking-dot-color);
 }
 
 .bot-message .thinking-dots span:nth-child(1) { animation-delay: 0s; }
@@ -567,7 +619,9 @@ body {
     transition: border-color 0.2s ease;
 }
 .chat-input-area:focus-within {
-    border-color: var(--bg-accent);
+    /* border-color: var(--bg-accent); REMOVED - No border color change on focus */
+    border-color: transparent; /* Make border transparent on focus */
+    box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.3); /* Optional: keep a subtle shadow or remove too */
 }
 
 
@@ -584,8 +638,8 @@ body {
     overflow-y: auto; 
     font-family: var(--font-family-main);
 }
-#userInput::placeholder {
-    color: var(--text-muted);
+#userInput:focus {
+    outline: none; /* Remove default browser outline */
 }
 #userInput::-webkit-scrollbar { width: 5px; }
 #userInput::-webkit-scrollbar-thumb { background-color: var(--border-color); border-radius: 3px; }
@@ -1114,4 +1168,188 @@ h1 .char { /* from previous example, might be reused or adapted */
 .nav-section-header.folder-header .folder-name-link .lottie-sidebar-icon {
     margin-right: 8px;
     flex-shrink: 0;
+}
+
+/* Hover Trigger for Collapsed Sidebar */
+.sidebar-hover-trigger {
+    position: fixed; /* Or absolute if app-layout is the positioning context */
+    left: 0;
+    top: 0;
+    width: 10px; /* Adjust width as needed for sensitivity */
+    height: 100vh; /* Full height */
+    /* background-color: rgba(255, 0, 0, 0.1); */ /* For debugging visibility */
+    z-index: 99; /* Below sidebar when open, but able to receive hover */
+    display: none; /* Initially hidden, shown by JS when sidebar is collapsed */
+}
+
+.sidebar.collapsed + .main-content .sidebar-hover-trigger {
+    /* This selector is a bit tricky. JS will handle visibility directly. */
+}
+
+/* Thinking dots - update for light mode variable */
+.bot-message .thinking-dots span {
+    display: inline-block;
+    /* opacity: 0.5; REMOVED - Rely on color variable */
+    margin: 0 1px;
+    animation: blink 1.4s infinite both;
+    color: var(--lottie-thinking-dot-color);
+}
+
+/* Ensure copy button icon color is updated for light theme if needed */
+.light-mode .copy-btn i {
+    color: var(--text-primary);
+}
+
+.light-mode .copy-btn:hover {
+    background-color: rgba(0, 0, 0, 0.08); /* Darker subtle hover for light mode */
+}
+
+/* Ensure model button text color is correct in light mode when not active */
+.light-mode .model-btn {
+    background-color: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+.light-mode .model-btn:hover {
+    background-color: #d8dcde; /* Slightly darker tertiary for hover */
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+}
+
+.light-mode .model-btn.active {
+    background-color: var(--bg-accent);
+    color: white; /* Text on accent remains white */
+    border-color: var(--bg-accent);
+}
+
+.light-mode .model-btn.active:hover {
+    background-color: #0e8a6a; /* Darker accent for active hover */
+}
+
+/* Ensure filter button text color is correct in light mode */
+.light-mode .filter-btn {
+    background-color: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+.light-mode .filter-btn:hover {
+    background-color: #d8dcde; 
+    color: var(--text-primary);
+}
+.light-mode .filter-btn.active {
+    background-color: var(--text-primary); /* Dark background for active filter */
+    color: var(--bg-secondary); /* Light text on dark background */
+    border-color: var(--text-primary);
+}
+
+/* Adjust Lottie icon colors if they are class-based or have filter issues in light mode */
+/* This usually means Lottie files should be designed to be theme-agnostic or have configurable colors via JS */
+
+/* General Sidebar List Item Styling for Options Button */
+.sidebar-nav .nav-section ul > li {
+    position: relative;
+}
+
+.sidebar-nav .nav-section ul > li:hover .chat-options-btn {
+    opacity: 1;
+}
+
+.chat-options-btn {
+    /* Inherits from .icon-btn-sm which has opacity 0 by default */
+    /* position: absolute; right: 5px; top: 50%; transform: translateY(-50%); */
+    /* The above is already in .nav-section ul li .icon-btn-sm */ 
+}
+
+/* Action Choice Modal Specific Styles */
+.nav-section-header.folder-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.8em;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background-color: transparent;
+    transition: background-color 0.2s ease;
+    position: relative;
+}
+
+.chats-in-folder-list {
+    list-style: none;
+    padding-left: 20px;
+    overflow: hidden;
+    margin-top: 8px;
+}
+
+.chats-in-folder-list li {
+    position: relative;
+}
+
+.chats-in-folder-list li a {
+    padding: 6px 8px;
+}
+
+.nav-section-header.folder-header .folder-action-buttons .icon-btn {
+    opacity: 1;
+    color: var(--text-muted);
+}
+
+.nav-section-header.folder-header .folder-action-buttons .icon-btn:hover {
+    color: var(--text-primary);
+    background-color: var(--bg-tertiary);
+}
+
+.nav-section-header.folder-header .folder-name-link .lottie-sidebar-icon {
+    margin-right: 8px;
+    flex-shrink: 0;
+}
+
+/* Hover Trigger for Collapsed Sidebar */
+.sidebar-hover-trigger {
+    position: fixed; /* Or absolute if app-layout is the positioning context */
+    left: 0;
+    top: 0;
+    width: 10px; /* Adjust width as needed for sensitivity */
+    height: 100vh; /* Full height */
+    /* background-color: rgba(255, 0, 0, 0.1); */ /* For debugging visibility */
+    z-index: 99; /* Below sidebar when open, but able to receive hover */
+    display: none; /* Initially hidden, shown by JS when sidebar is collapsed */
+}
+
+.sidebar.collapsed + .main-content .sidebar-hover-trigger {
+    /* This selector is a bit tricky. JS will handle visibility directly. */
+}
+
+/* Specific Light Mode Component Adjustments */
+.light-mode .copy-btn i {
+    color: var(--text-primary);
+}
+
+.light-mode .app-logo-title span, /* My Chats in sidebar header */
+.light-mode .current-chat-name h2, /* Name chat in main header */
+.light-mode .bot-message p#initial-bot-message-content, /* Initial bot message */
+.light-mode .chat-model-tag /* Ensure chat model tag text is also updated */
+{
+    color: var(--text-primary);
+}
+
+.light-mode .sidebar-nav .nav-section-header .folder-name-link span, /* Folder names */
+.light-mode .sidebar-nav .nav-section ul li a .chat-title, /* Chat titles in sidebar */
+.light-mode .sidebar-nav .nav-section ul li a .chat-snippet /* Chat snippets in sidebar */
+{
+    color: var(--text-secondary); /* Or --text-primary if you want them darker */
+}
+
+.light-mode .sidebar-nav li[data-chat-id].active-chat a .chat-title,
+.light-mode .sidebar-nav li[data-chat-id]:hover a .chat-title,
+.light-mode .sidebar-nav .folder-item .nav-section-header.folder-header:hover .folder-name-link span {
+    color: var(--text-primary);
+}
+
+.light-mode .copy-btn:hover {
+    background-color: rgba(0, 0, 0, 0.08); /* Darker subtle hover for light mode */
 } 
