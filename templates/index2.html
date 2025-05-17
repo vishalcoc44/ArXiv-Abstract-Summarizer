@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Modern Chat UI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style2.css') }}">
+    <!-- GSAP CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js" defer></script>
+    <!-- Font Awesome CDN -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <!-- Marked.js CDN for Markdown Rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js" defer></script>
+    <!-- Lottie Player CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js" defer></script>
+</head>
+<body>
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="app-logo-title">
+                    <i class="fas fa-brain app-icon"></i> <!-- App Logo/Icon -->
+                    <span>My Chats</span>
+                </div>
+                <button class="sidebar-toggle-btn"><i class="fas fa-sliders-h"></i></button>
+            </div>
+            <div class="search-bar">
+                <i class="fas fa-search search-icon"></i>
+                <input type="text" placeholder="Search">
+            </div>
+            <nav class="sidebar-nav">
+                <div class="nav-section">
+                    <div class="nav-section-header">
+                        <span>Folders</span>
+                        <div>
+                            <button class="icon-btn" id="add-folder-btn"><i class="fas fa-plus-circle"></i></button>
+                            <button class="icon-btn" data-section-toggle="folders-list"><i class="fas fa-chevron-down"></i></button>
+                        </div>
+                    </div>
+                    <ul id="folders-list">
+                        <!-- Dynamic folders will be populated here -->
+                    </ul>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-header">
+                        <span>Chats</span>
+                        <button class="icon-btn" data-section-toggle="chats-list"><i class="fas fa-chevron-down"></i></button>
+                    </div>
+                    <ul id="chats-list">
+                        <!-- Dynamic chats (categorized) were originally here, but now all chats will be under folders or uncategorized -->
+                        <!-- This specific UL might be redundant if all chats are strictly within folders or a separate 'uncategorized' list -->
+                        <!-- For now, let's keep it but expect it to be empty or repurposed if chats are only shown within folders or a separate 'uncategorized' list -->
+                    </ul>
+                </div>
+                <div class="nav-section" id="uncategorized-chats-section">
+                    <div class="nav-section-header">
+                        <span>Uncategorized Chats</span>
+                        <button class="icon-btn" data-section-toggle="uncategorized-chats-list"><i class="fas fa-chevron-down"></i></button>
+                    </div>
+                    <ul id="uncategorized-chats-list">
+                        <!-- Dynamic uncategorized chats will be populated here -->
+                    </ul>
+                </div>
+            </nav>
+            <button class="new-chat-btn">
+                <div id="lottie-new-chat-icon" style="width: 20px; height: 20px; margin-right: 8px; display: inline-block; vertical-align: middle;"></div> New chat
+            </button>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main class="main-content">
+            <header class="chat-header">
+                <div class="current-chat-name">
+                    <button class="icon-btn"><i class="fas fa-chevron-left"></i></button>
+                    <h2>Name chat</h2>
+                    <span class="chat-model-tag">ArXiv Retrieval</span>
+                </div>
+                <div class="chat-actions">
+                    <button class="icon-btn"><i class="fas fa-bookmark"></i></button>
+                    <button class="icon-btn"><i class="fas fa-upload"></i></button>
+                </div>
+            </header>
+            
+            <div id="chat-view" class="chat-view-container"> <!-- Renamed for clarity -->
+                 <!-- Initial Prompt Area -->
+                <div class="initial-prompt-area">
+                    <div class="main-prompt-logo">
+                        <div id="lottie-main-prompt-logo" style="width: 70px; height: 70px;"></div>
+                    </div>
+                    <h1>How can I help you today?</h1>
+                    <p class="prompt-subtitle">This code will display a prompt asking the user for their name, and then it will display a greeting message with the name entered by the user.</p>
+                    <div class="suggestion-cards">
+                        <div class="card">
+                            <i class="fas fa-save card-icon"></i>
+                            <h3>Saved Prompt Templates</h3>
+                            <p>Users save and reuse prompt templates for faster responses.</p>
+                        </div>
+                        <div class="card">
+                            <i class="fas fa-photo-video card-icon"></i>
+                            <h3>Media Type Selection</h3>
+                            <p>Users select media type for tailored interactions.</p>
+                        </div>
+                        <div class="card">
+                            <i class="fas fa-language card-icon"></i>
+                            <h3>Multilingual Support</h3>
+                            <p>Choose language for better interaction.</p>
+                        </div>
+                    </div>
+                    <div class="content-type-filter">
+                        <button class="filter-btn active">All</button>
+                        <button class="filter-btn">Text</button>
+                        <button class="filter-btn">Image</button>
+                        <button class="filter-btn">Video</button>
+                        <button class="filter-btn">Music</button>
+                        <button class="filter-btn">Analytics</button>
+                    </div>
+                </div>
+
+                <!-- Chat Output Area -->
+                <div id="chat-output" class="chat-output-area">
+                    <!-- Messages will be appended here by JavaScript -->
+                     <div class="message bot-message"><p id="initial-bot-message-content">Hi there! Ask me anything.</p></div>
+                </div>
+            </div>
+
+            <footer class="chat-input-footer">
+                <div class="chat-input-area">
+                    <button class="input-icon-btn"><i class="fas fa-paperclip"></i></button> <!-- Attachment icon -->
+                    <textarea id="userInput" placeholder="Type your prompt here..."></textarea>
+                    <button id="sendButton" class="send-btn">
+                        <!-- <i class="fas fa-arrow-up"></i> -->
+                        <div id="lottie-send-button-icon" style="width: 24px; height: 24px;"></div>
+                    </button>
+                </div>
+                <div class="model-selection-area">
+                    <button id="gemma-btn" class="model-btn active">Gemma</button>
+                    <button id="gemini-btn" class="model-btn">Gemini</button>
+                </div>
+            </footer>
+        </main>
+    </div>
+
+    <!-- Generic Input Modal -->
+    <div id="inputModal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <h3 id="modalTitle">Enter Value</h3>
+            <input type="text" id="modalInput" placeholder="Value">
+            <div class="modal-actions">
+                <button id="modalCancelBtn" class="modal-btn modal-btn-cancel">Cancel</button>
+                <button id="modalSubmitBtn" class="modal-btn modal-btn-submit">Submit</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Folder Selection Modal -->
+    <div id="folderSelectModal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <h3 id="folderSelectModalTitle">Move Chat To...</h3>
+            <div id="folderSelectList" class="folder-select-list">
+                <!-- Folder options will be populated here by JavaScript -->
+            </div>
+            <div class="modal-actions">
+                <button id="folderSelectCancelBtn" class="modal-btn modal-btn-cancel">Cancel</button>
+                <!-- No submit button needed if selection itself triggers action -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Action Choice Modal -->
+    <div id="actionChoiceModal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <h3 id="actionChoiceModalTitle">Chat Options</h3>
+            <p id="actionChoiceModalMessage">What would you like to do?</p>
+            <div class="modal-actions action-choice-buttons">
+                <button id="actionChoiceOption1Btn" class="modal-btn">Action 1</button>
+                <button id="actionChoiceOption2Btn" class="modal-btn">Action 2</button>
+                <button id="actionChoiceOption3Btn" class="modal-btn" style="display: none;">Action 3</button>
+                <button id="actionChoiceCancelBtn" class="modal-btn modal-btn-cancel">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script2.js') }}" defer></script>
+</body>
+</html> 

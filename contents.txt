@@ -1,0 +1,574 @@
+AI-driven academic assistance: 
+Fine Tuning LLM for ArXiv 
+Vishal S 
+Department Of Computer Science and Engineering  
+Dayananda Sagar University 
+India, Bengaluru 
+Vaibhav V.B. 
+Department Of Computer Science and Engineering  
+Dayananda Sagar University 
+India, Bengaluru 
+Abstract — Fine-tuning a Large Language Model (LLM) 
+for information retrieval from ArXiv enhances AI-driven aca
+demic 
+research 
+ly relevant responses. 
+by allowing accurate and 
+This 
+contextual
+project develops an 
+driven retrieval system with LangChain, Ollama (Llama 3.1), 
+and FAISS/ChromaDB to enhance research paper summaries, 
+topic discovery, and citation extraction.  In contrast to conven
+tional keyword-based search, this method fine-tunes an LLM 
+with domain-specific ArXiv data in computer science, physics, 
+and mathematics for more accurate retrieval. Cur
+rent methods typically generate irrelevant topics in the out
+put or hallucinations. This is resolved through optimizing re
+trieval mechanisms, embedding generation, and prompt engi
+neering. The system will pre-process papers, save vector em
+beddings, and polish responses using a fine-tuned LLM. Ex
+pected outcomes include improved retrieval accuracy, reduced 
+hallucinations, and better contextual understanding, ena
+bling researchers, students, and instructors to have a more 
+efficient means of accessing scholarly knowledge. 
+Index Terms — Information Retrieval, Research Paper Sum
+marization, Citation Extraction, Topic Exploration, Vector 
+Embeddings, AI-driven Scholarly Assistance. 
+I. INTRODUCTION  
+The ability to retrieve relevant academic literature in an 
+efficient manner is essential for researchers, students, and 
+instructors. Conventional keyword-based search engines tend 
+to overlook the contextual subtleties involved in complex 
+queries and therefore provide outputs that are irrelevant or 
+incomplete. As the number of research papers on repositories 
+like ArXiv increases daily, there is an increasing need for AI
+driven solutions that provide accurate and contextually sensi
+tive cademic search functionality. Recent developments in 
+Retrieval-Augmented Generation (RAG) and Large Lan
+guage Models (LLMs) have pushed the level of information 
+retrieval; however, problems such as retrieval accuracy, hal
+lucinations, and contextual relevance remain rampant, espe
+cially due to a dependence on generic retrieval strategies that 
+lack expert domain knowledge. 
+This work presents a fine-tuned LLM-based research paper 
+retrieval system using LangChain, Ollama (Llama 3.1), and 
+FAISS/ChromaDB to improve research paper summariza
+tion, topic discovery, and citation extraction. By pre
+processing papers via text chunking, vector embedding crea
+tion, and indexing in a retrieval database, along with domain
+specific fine-tuning on ArXiv data in computer science, 
+Pihu Mittal 
+Department Of Computer Science and Engineering  
+Dayananda Sagar University 
+India, Bengaluru 
+Dr. Meenakshi Malhotra 
+Department Of Computer Science and Engineering  
+Dayananda Sagar University 
+India, Bengaluru 
+AI
+physics, and mathematics, our system provides higher accu
+racy in scholarly responses. Optimized retrieval processes, 
+fine-tuned LLMs for better contextual relevance, and sophis
+ticated prompt engineering to improve response coherence 
+and reduce hallucinations are the main contributions. This 
+work fills the gap between conventional search engines and 
+smart AI-based academic tools, with the promise of im
+proved retrieval accuracy, contextual understanding, and 
+lower hallucination rates. 
+ PROBLEM STATEMENT 
+Scientific publication growth at an unprecedented rate, 
+especially on preprint repositories such as ArXiv, has created 
+a massive challenge for researchers, students, and practition
+ers trying to search and synthesize relevant information ef
+fectively. With millions of papers across many areas from 
+Computer Science to Physics and Mathematics, the volume 
+and the high rate of publication overwhelm traditional search 
+strategies. Keyword-based approaches, such as TF-IDF and 
+BM25, prevail in traditional search engines; however, they 
+are intrinsically constrained by their dependence on exact 
+word matching. These approaches are plagued by shortcom
+ings in capturing semantic subtlety, not addressing synony
+my problems (e.g., "graph neural networks" vs. "GNNs") and 
+polysemy problems (e.g., "model" as in a mathematical ob
+ject vs. physical model), and in many cases leading to irrele
+vance or inability to capture relevant papers failing to match 
+the query terms exactly. This ineffectiveness disenfranchises 
+researchers from keeping up with innovation, finding appro
+priate methodologies, and deriving actionable insight from 
+the extensive ArXiv repository. 
+New natural language processing developments, including 
+semantic retrieval through dense vector embeddings and Re
+trieval-Augmented Generation (RAG) through Large Lan
+guage Models (LLMs), provide promising avenues of im
+provement. Existing approaches are insufficient to meet the 
+specific needs of ArXiv, however. Generic semantic search 
+models are not domain-optimized, and the large, general 
+LLMs integrated in RAG systems tend to value open-ended 
+generation over context-sensitive, accurate assistance, which 
+presents the risks of misinformation and computational inef
+ficiency. Moreover, the high resource requirements of such 
+models render them implausible for widespread academic 
+application without optimization. Hence, there exists an ur
+gent need for a system that integrates efficient, meaning
+based retrieval with a domain-specialized, streamlined LLM 
+to facilitate accurate, reliable, and accessible academic sup
+port empowering researchers to search and leverage the 
+ArXiv repository efficiently for scientific advancement. 
+III. METHODOLOGY AND SYSTEM DESIGN 
+The "AI-driven academic assistance : Fine-Tuning LLM 
+for ArXiv " system is a pipeline architecture for processing 
+user queries and offering pertinent information gleaned or 
+derived from ArXiv abstracts. The architecture is centered 
+around effective retrieval followed by focused LLM 
+processing. 
+The figure depicts the central workflow. A user asks a 
+question, which is translated into a semantic representation. 
+This is utilized to search efficiently through a pre-computed 
+index of ArXiv abstracts. The most relevant abstracts are 
+returned, and then optionally processed by a fine-tuned, 
+special-purpose LLM to extract or synthesize the important 
+information pertaining to the query from within the abstracts, 
+giving direct aid to the user. 
+The pipeline pieces are outlined below: 
+A. Data Preprocessing and Curation 
+The system is built atop a curated dataset taken from the 
+ArXiv metadata snapshot from Kaggle. 
+Filtering: We read the metadata file line-by-line to save 
+memory. Abstracts are filtered to contain only top-level 
+categories in Computer Science ('cs.'), Physics ('physics.', 
+'astro-ph.', 'cond-mat.', 'hep-', 'nucl-', 'quant-ph'), and 
+Mathematics ('math.'). 
+(e.g., 
+Cleaning: General text cleaning is performed on the abstract 
+text 
+stripping 
+normalization). 
+surplus 
+whitespace, 
+Unicode 
+Output: The output is a JSON file (abstracts.json) where each 
+record includes the ArXiv ID, title, authors, and cleaned 
+abstract text for the corresponding papers. This is our target 
+corpus. 
+B. Semantic Indexing Pipeline 
+For enabling efficient semantic search, we generate dense 
+vector representations for all the abstracts and index them 
+with FAISS. 
+Embedding Generation: The 'all-MiniLM-L6-v2' model from 
+Sentence Transformers library is employed. It is selected 
+based on its trade-off between performance and efficiency, 
+projecting variable-length abstract text into fixed-size 384
+dimensional dense vectors (float32). All the abstracts in 
+abstracts.json are processed, and the generated embeddings 
+are stored as a NumPy array (abstract_embeddings.npy). [6] 
+Metadata Mapping: A Python dictionary mapping the row 
+index in the embedding array to the corresponding abstract 
+metadata (ID, title, abstract text) is constructed and stored 
+using pickle (abstract_metadata.pkl). This enables rapid 
+retrieval of abstract information from a search result index. 
+FAISS Index Construction: We utilize the FAISS library to 
+construct the search index. An IndexFlatL2 index is selected. 
+This index performs exact k-nearest neighbor search over 
+Euclidean distance (L2). Though not the most scalable for a 
+billion vectors, it ensures correctness for moderately large 
+collections (millions of abstracts) and provides a solid 
+baseline. The abstract_embeddings.npy embeddings are 
+added to this index, which is subsequently saved to disk 
+(faiss_index.bin). [7] 
+C. LLM Fine-Tuning for Academic Support 
+One of the central features of our system is the fine-tuned 
+LLM as an optional step in processing the retrieved results. 
+We fine-tune the Gemma 3-4B model for the purpose of 
+tasks appropriate for academic support based on retrieved 
+context, not general generation. [19] 
+Retrieval-Aware Synthetic Dataset Generation: 
+Objective: To train the LLM to pull out or derive information 
+pertaining to a question from given context snippets only. 
+Process: We mimic the retrieval process. For a subset of 
+abstracts in our dataset: 
+Synthetic Query Generation: A trivial heuristic or maybe 
+another LLM may be utilized to produce a reasonable 
+question whose answer could lie in the abstract (e.g., "What 
+is the principal method employed in [abstract title]?"). 
+Context Retrieval Simulation: For every generated query, we 
+add it and conduct a FAISS search across our index in order 
+to obtain the top-k abstracts (including possibly the source 
+abstract, and others). The returned abstracts constitute the 
+"Context". 
+Target "Answer" Generation: The target output is not a freely 
+generated answer. Rather, it's highly constrained or 
+extractive synthesis. We employ a straightforward heuristic: 
+the first ~50 words of the original source abstract linked with 
+the synthetic query. This serves as a proxy for the most 
+salient information. 
+Formatting: The data is presented as: 
+Question: 
+[Synthetic Query] 
+Context: 
+[Concatenated text of retrieved abstracts] 
+Answer 
+[First ~50 to 60 words of the original source abstract] 
+Rationale: This conditions the LLM to extract and regenerate 
+the most critical piece(s) of context pertaining to the 
+question, strongly conditioning it on the given text. 
+Model Fine-Tuning Configuration: 
+Base Model: Google's Gemma 3-4B Selected due to its 
+robust performance per size [19]. 
+Quantization: We initialize the model in 4-bit with the 
+bitsandbytes library, saving considerable memory. This 
+allows fine-tuning to become possible on available hardware 
+(e.g., single consumer GPU). [15] 
+Fine-Tuning Method: We use Parameter-Efficient Fine
+Tuning (PEFT), namely LoRA (Low-Rank Adaptation) [Hu 
+et al. 2021], with the peft library from Hugging Face. We 
+train only a small set of adapter weights while leaving the 
+original LLM parameters frozen. 
+Framework: The Hugging Face transformers library [Wolf et 
+al. 2020] is utilized to load the model, tokenizer, data 
+management (datasets), and training (Trainer). 
+Training: The fine-tuning loop is managed through the 
+Trainer class using the generated synthetic dataset. Default 
+hyperparameters for LoRA fine-tuning are employed (e.g., 
+rank r, alpha, learning rate). 
+Output: The operation produces a optimized Gemma 
+checkpoint (adapter weights) for retrieval of scientific text 
+snippets in reply to a given query, concentrating on 
+extraction or constrained synthesis. 
+D. Integrate Application Workflow 
+The units are combined in a straightforward application (e.g., 
+Flask-based) that stages the process: 
+Initialization: Loading the FAISS index (faiss_index.bin), 
+metadata map (abstract_metadata.pkl), Sentence Transformer 
+model, and the 4-bit optimized Gemma model with its 
+adapter weights and tokenizer. 
+User Query: Get a natural language user query. 
+Retrieval: Embed the query with the Sentence Transformer 
+and search the FAISS index to obtain the indices of the top-k 
+(e.g., k=5) most similar abstracts. Get the full metadata (ID, 
+title, abstract text) with the metadata map. 
+LLM Processing (Optional/Configurable): 
+Build a prompt with the user query and the concatenated text 
+of the retrieved abstracts (as context). 
+Employ the fine-tuned Gemma model's generate() function. 
+Most importantly, the prompt form and possibly generation 
+parameters (such as max_new_tokens) are configured to 
+promote extractive or strongly context-dependent synthesis, 
+not novel generation. As an example, the prompt could be 
+completed with: "Based strictly on the context supplied, the 
+salient information is:". 
+Presentation: Present the outcome to the user. This may be: 
+Option 1: The raw list of fetched abstract titles and text. 
+Option 2: The LLM-created extraction/synthesis, perhaps in 
+addition to the source abstracts for confirmation. 
+IV. RESULTS AND EVALUATION 
+Although final experimental results are awaited, the 
+following section summarizes the plan for evaluation and 
+expected results, concentrating on the success of both the 
+retrieval and the LLM assistance aspects. 
+A. Experimental Setup 
+Dataset: The system is trained on a filtered subset of the 
+ArXiv dataset (about N abstracts from CS, Physics, Math 
+domains, e.g., N=1.5 Million). 
+Test Set: A test question-abstract pair set will be employed. 
+This might include manually crafting queries for certain 
+ArXiv abstracts or converting existing scientific QA 
+benchmarks if mapping to ArXiv IDs is feasible. 
+Metrics: 
+Retrieval Quality (Primary Measure): Tested against 
+standard IR metrics on retrieving the known relevant 
+abstract(s) for a specified query in top-k results. 
+Mean Reciprocal Rank (MRR) 
+Recall@k (e.g., R@1, R@5, R@10) 
+Precision@k (e.g., P@1, P@5, P@10) 
+Normalized Discounted Cumulative Gain (NDCG@k) 
+LLM Assistance Quality (Secondary, if LLM applied): 
+Tested on output produced by the fine-tuned Gemma model 
+based on retrieved context. 
+Faithfulness/Attribution: To what extent does the produced 
+output mirror only information within the retrieved abstracts? 
+It can be determined through human inspection or possibly 
+automated metrics/LLM-as-judge methods cross-checking 
+with the context. High faithfulness is essential. 
+Accuracy/Relevance (for Extractive Tasks): If the task is 
+extractive QA or summarization versus a ground truth from 
+the source abstract only, then metrics such as F1 score, Exact 
+Match (EM), ROUGE (e.g., ROUGE-L), and perhaps 
+BERTScore can be utilized. 
+Baselines for Comparison: 
+Keyword Search: Basic BM25 retrieval deployed with a 
+library such as rank_bm25 over the abstract text. 
+Base Dense Retrieval: Our system with Sentence 
+Transformers and FAISS without post-processing with any 
+LLM (Option 1 output). 
+(Optional) Zero-Shot LLM: The base Gemma 3-4B model 
+(quantized but not fine-tuned) employed with the same 
+prompt structure for extraction/synthesis, to measure the 
+effect of fine-tuning. 
+B. Expected Retrieval Performance 
+We expect that the semantic retrieval module will have a 
+much better performance than the keyword baseline. 
+Analysis: We anticipate that semantic search (AI Driven 
+Academic Assistannt) will have significantly higher MRR 
+and Recall@k than BM25. This means that semantically 
+similar abstracts are placed higher and are located more often 
+in the top results, even though they do not contain the same 
+exact keywords as the query. This corrects a fundamental 
+flaw of traditional search. 
+C. Anticipated Impact of Fine-Tuned LLM Processing 
+The fine-tuned LLM should give accurate and faithful 
+help solely on the basis of the retrieved context. 
+Table 1: Expected LLM Assistance Quality 
+Metric 
+Zero-Shot 
+Gemma 
+Fine-Tuned 
+Gemma 
+(Expected) 
+Faithfulness Moderate
+High 
+Very High 
+Notes 
+Evalu
+ated 
+via 
+human or 
+automated 
+metrics 
+ROUGE-L 
+(F1) 
+~0.50 
+~0.65 
+Against 
+ground 
+truth from 
+context. 
+BERTScore 
+(F1) 
+~0.85 
+~0.90 
+Measur
+ es semantic 
+similarity 
+to reference 
+Analysis: We anticipate that the fine-tuned Gemma will 
+demonstrate much better faithfulness, i.e., it will strictly 
+follow 
+the 
+given retrieved abstracts, minimizing 
+hallucination against a zero-shot model that could mix up 
+retrieved information with parametric knowledge. In the case 
+of extractive/synthesis tasks, we also hope for improved 
+ROUGE and BERTScore scores against the zero-shot 
+baseline, showing that the fine-tuning makes the model more 
+able to identify and shape the key information as specified 
+under our synthetic task setting. 
+D. Qualitative Analysis (Expected) 
+Take the example question: "What recent papers are 
+discussing the use of graph neural networks for molecular 
+property prediction?" 
+BM25 Expected Results: Could report papers containing 
+literal keywords such as "graph neural networks" and 
+"molecular property prediction" and fail to include useful 
+papers with synonyms such as "GNNs," "molecule," or 
+"predicting chemical properties." Relevance papers which 
+include the words in another sense may also turn up. 
+Base Dense Retrieval Expected Results: Expected to give a 
+more semantically relevant list, with papers that utilize 
+synonyms or related terms. The ranking must be more 
+representative of true relevance. E.g., [List of top-k relevant 
+abstract titles/IDs]. 
+Fine-Tuned LLM Support Expected Outcomes: With the top
+k retrieved abstracts, the LLM response would be a brief 
+summary: "From the retrieved abstracts, recent studies 
+investigate GNNs for predicting molecular properties on 
+[refer key method from abstract 1], enhancing accuracy in 
+[refer property from abstract 2], and employing new 
+architectures such as [refer architecture from abstract 3]. 
+Refer to papers [ID1], [ID2], [ID3]." The response is drawn 
+directly from context and offers real-time support. 
+Error Analysis (Expected): Retrieval failures could happen 
+for very niche or newly minted words not well covered in the 
+embedding space. The LLM may have difficulty 
+synthesizing across conflicting information if retrieved 
+abstracts contain conflicting opinions (although the aim is 
+mostly extraction/synthesis per abstract or mere 
+aggregation). Adherence to the context is of utmost 
+importance; any "hallucination" or addition of external 
+knowledge would be a failure. 
+E. Efficiency Considerations 
+Retrieval Latency: With FAISS IndexFlatL2, retrieval 
+latency for top-k results from ~1.5M vectors should be in the 
+tens to low hundreds of milliseconds on a typical CPU, 
+which allows for interactive usage. 
+LLM Processing: With the 4-bit quantized Gemma 3-4B 
+model, the VRAM demand is much lower (e.g., < 5GB), so it 
+can run on consumer-level GPUs. Inference latency to 
+produce the short extractive/synthetic responses will be 
+hardware-dependent but hopefully within acceptable bounds 
+for an interactive system (e.g., a few seconds). Quantization 
+enables embedding the LLM without expensive hardware. 
+V. DISCUSSION 
+The "Al-driven academic assistance" proposal showcases 
+a likely viable method of accessing the expansive ArXiv 
+archive. Its central strength comes from merging the 
+efficient, sememe-based semantic search with Sentence 
+Transformers and FAISS with the task-specific LLM fine
+tuned for context-specific help work. This synergy promises 
+to escape the keyword searching deficiency by taking into 
+account the intent of a query and harnessed power of LLMs 
+in an optimal, constrained fashion. 
+The fine-tuning of a quantized LLM (Gemma 3-4B) for 
+extraction and synthesis exclusively based on retrieved text 
+is promising. The synthetic dataset with retrieval awareness 
+prompts the model to behave as a clever information 
+processor instead of an open-ended generator. This emphasis 
+on faithfulness is important for use cases in scientific areas 
+where accuracy and attribution are key. Quantization renders 
+this LLM integration feasible on typical hardware. 
+Limitations: 
+Abstracts Only: The system now only works on abstracts, 
+which do not have the full detail of full papers. 
+Retrieval Scalability: IndexFlatL2 is exact and thus perfect 
+for accuracy but scales poorly to tens or hundreds of millions 
+of documents. Approximate nearest neighbor indices (e.g., 
+IVF, HNSW) would be required for very large corpora, 
+sacrificing some accuracy for speed and scalability. 
+Evaluation Difficulty: It is difficult to evaluate the 
+"correctness" of retrieval beyond basic known-item finding. 
+Careful choice of metric and possibly human judgment is 
+needed to determine the quality and fidelity of the LLM's 
+aid. 
+Synthetic Data Heuristic: The fine-tuning dataset is based on 
+a straightforward heuristic (first 50 words) for the target 
+response. More advanced strategies for creating query
+summary/extraction pairs from abstracts could be used to 
+further enhance LLM performance. 
+LLM Faithfulness: Fine-tuning strives for faithfulness, but 
+keeping the LLM from ever introducing external information 
+necessitates continuous caution in prompting and testing. 
+Future Work: 
+Full-Text Integration: Scaling the system to index and 
+retrieve from full papers is a essential follow-up task. This 
+comes with parsings of documents, segmentations, and 
+scaling the indexing/retrieval process. 
+Scalable Indices: Exploring and enabling approximate 
+nearest neighbor indices (FAISS IVF or HNSW) to be used 
+on larger corpora cost-effectively. 
+Enhanced LLM Fine-Tuning: Building more advanced 
+synthetic dataset generation methods and fine-tuning targets 
+specifically optimized for extraction, summarization, and 
+comparison tasks over scientific text.  
+Enhanced Evaluation: Establishing more stringent 
+benchmarks and measures for assessing retrieval relevance 
+and LLM assistance quality (particularly faithfulness) when 
+applied to searching scientific literature. 
+User Feedback Integration: Using user feedback (e.g., 
+relevance judgments, thumbs up/down on LLM output) to 
+dynamically enhance retrieval ranking or further fine-tune 
+the LLM. 
+VI. CONCLUSION 
+"Al-driven academic assistance is introduced as a system 
+for augmenting information discovery in the ArXiv 
+repository. By integrating strong semantic retrieval with 
+Sentence Transformers and FAISS with a 4-bit quantized 
+Gemma LLM fine-tuned for context-specific extraction and 
+synthesis, the system seeks to offer researchers precise and 
+effective academic support. The method utilizes dense vector 
+search to bypass keyword constraints and applies a 
+customized LLM, trained through a retrieval-aware synthetic 
+dataset, to handle retrieved information accurately. Early 
+evaluation and anticipated outcomes indicate substantial 
+advancements over conventional approaches in retrieval 
+relevance and the promise of targeted, LLM-based support. 
+However limitations do apply, especially with respect to 
+abstract-only processing and complexity of evaluation, but 
+the framework presents a promising avenue for developing 
+useful tools to assist researchers in navigating the 
+increasingly vast terrain of scientific literature. Future 
+research will focus on scaling, full-text integration, and fine
+tuning the LLM adaptation for improved, reliable academic 
+assistance. 
+REFERENCES 
+• [1] Manning, C. D., Raghavan, P., & Schütze, H. 
+(2008). Introduction to Information Retrieval. Cam
+bridge University Press. 
+• [2] Robertson, S. E., & Zaragoza, H. (2009). The 
+probabilistic relevance framework: BM25 and be
+yond. Foundations and Trends® in Information Re
+trieval, 3(4), 333–389. 
+• [3] Vesnic-Alujevic, L. (2014). The challenges of 
+finding information in the jungle of scientific publi
+cations. Proceedings of the European Conference on 
+Information Literacy, 497–503. 
+• [4] Khabsa, M., & Giles, C. L. (2014). The number 
+of scholarly documents on the public web. PloS 
+one, 9(5), e93949. 
+• [5] Bornmann, L., & Mutz, R. (2015). Growth rates 
+of modern science: A bibliometric analysis based on 
+the Web of Science database. Journal of the Associ
+ation for Information Science and Technology, 
+66(11), 2215–2222. 
+• [6] Reimers, N., & Gurevych, I. (2019). Sentence
+BERT: Sentence Embeddings using Siamese 
+BERT-Networks. Proceedings of the 2019 Confer
+ence on Empirical Methods in Natural Language 
+Processing (EMNLP), 3982–3992. 
+• [7] Johnson, J., Douze, M., & Jégou, H. (2019). Bil
+lion-scale similarity search with GPUs. IEEE 
+Transactions on Big Data, 7(3), 535-547. 
+• [8] Karpukhin, V., Oğuz, B., Min, S., Lewis, P., 
+Wu, L., Edunov, S., Chen, D., & Yih, W. (2020). 
+Dense Passage Retrieval for Open-Domain Ques
+tion Answering. Proceedings of the 2020 Confer
+ence on Empirical Methods in Natural Language 
+Processing (EMNLP), 6769–6781. 
+• [9] Karpukhin, V., Oğuz, B., Min, S., Lewis, P., 
+Wu, L., Edunov, S., Chen, D., & Yih, W. (2020). 
+Dense Passage Retrieval for Open-Domain Ques
+tion Answering. Proceedings of the 2020 Confer
+ence on Empirical Methods in Natural Language 
+Processing (EMNLP), 6769–6781. 
+• [10] Lewis, P., Perez, E., Piktus, A., Petroni, F., 
+Karpukhin, V., Goyal, N., Küttler, H., Lewis, M., 
+Yih, W. T., Rocktäschel, T., Riedel, S., & Kiela, D. 
+(2020). 
+Retrieval-Augmented Generation for 
+Knowledge-Intensive NLP Tasks. Advances in 
+Neural Information Processing Systems, 33, 9459
+9474. 
+• [11] Guu, K., Lee, K., Tung, Z., Pasupat, P., & 
+Chang, M. W. (2020). Retrieval Augmented Lan
+guage Model Pre-Training. Proceedings of the 37th 
+International Conference on Machine Learning 
+(ICML), 3929–3938. 
+• [12] Mao, J., Liu, H., Wang, J., Jia, Y., & Zhao, D. 
+(2021). Query Expansion for Neural Information 
+Retrieval. arXiv preprint arXiv:2111.08523. 
+• [13] Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., 
+Li, Y., Wang, S., Wang, L., & Chen, W. (2021). 
+LoRA: Low-Rank Adaptation of Large Language 
+Models. International Conference on Learning Rep
+resentations (ICLR). 
+• [14] Nagel, M., Fournarakis, M., Amjad, R. A., 
+Bondarenko, Y., Van Baalen, M., & Blankevoort, 
+T. (2021). A White Paper on Neural Network Quan
+tization. arXiv preprint arXiv:2106.08295. 
+• [15] Dettmers, T., Pagnoni, A., Holtzman, A., & 
+Zettlemoyer, L. (2022). LLM.int8(): 8-bit Matrix 
+Multiplication for Transformers at Scale. Advances 
+in Neural Information Processing Systems, 35. 
+• [16] Hofstätter, S., Althammer, S., Schröder, M., 
+Musiol, M., & Zlabinger, M. (2023). Re-ranking is 
+plausible. arXiv preprint arXiv:2310.06983. 
+• [17] Dettmers, T., Lewis, M., Belkada, Y., & Zet
+tlemoyer, L. (2023). QLoRA: Efficient Finetuning 
+of Quantized LLMs. Advances in Neural Infor
+mation Processing Systems, 36. 
+• [18] Douze, M., Guzhva, A., Deng, C., Johnson, J., 
+Szilvasy, G., Mazaré, P.-E., Lomeli, M., Hosseini, 
+L., & Jégou, H. (2024). The Faiss library. Quantita
+tive InfraRed Thermography Journal, 1-6. 
+• [19] Gemma Team, Google. (2024). Gemma: Open 
+Models Based on Gemini Research and Technolo
+gy. arXiv preprint arXiv:2403.08295. 

@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+arxiv_env/
+venv/ # Assuming this is your virtual environment folder
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# Large data / Project specific
+arxiv_abstracts/
+Research Papers/
+fine_tuned_model_gemma_colab_3_1b/
+merged_gemma_1b_finetuned_hf/
+# Ignore large language model files
+*.gguf
+
+# Ignore the llama.cpp directory (adjust if you only want to ignore parts of it)
+# If llama.cpp is a submodule or external dependency, ignoring the whole thing is often appropriate.
+# If it's source code you've included, you might want to be more selective.
+llama.cpp/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE-specific (uncomment the ones you use)
+# .vscode/
+# .idea/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Ignore database file
+*.db
+
+.env
