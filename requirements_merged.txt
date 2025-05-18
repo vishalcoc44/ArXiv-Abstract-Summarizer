@@ -1,7 +1,0 @@
-flask
-transformers
-torch
-peft
-accelerate
-# sentencepiece # Often required by tokenizers like T5, Gemma, Llama
-# protobuf # Sometimes a dependency for certain model types or tokenizers 

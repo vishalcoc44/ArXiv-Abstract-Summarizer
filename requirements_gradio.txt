@@ -1,8 +1,0 @@
-numpy
-torch>=2.0.0
-transformers>=4.34.0
-gradio>=3.50.0
-psutil
-requests
-bitsandbytes>=0.40.0
-flask-socketio
