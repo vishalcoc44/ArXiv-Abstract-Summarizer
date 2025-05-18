@@ -460,9 +460,10 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
 
     # --- Phase 1: Gemini Paper Candidate Generation (Task 2 - Part 1) ---
     unique_gemini_paper_suggestions = [] 
-    gemini_suggestions_list_for_instruction = "" 
+    processed_titles_for_llm_instruction = "" # New variable for LLM instruction list
+    contextual_info_for_llm_about_papers = "" # New variable for context about papers for LLM
 
-    if is_paper_query and systems_status["gemini_model_configured"]:
+    if is_paper_query and systems_status["gemini_model_configured"] and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
         logger.info(f"Paper query detected. Attempting to get suggestions from Gemini for: '{actual_user_question[:100]}...'")
         try:
             gemini_papers_raw = get_gemini_paper_suggestions(actual_user_question)
@@ -484,8 +485,9 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                         arxiv_id = paper.get('arxiv_id')
                         full_title_str = f"{title}{f' (arXiv:{arxiv_id})' if arxiv_id else ''}"
                         simple_title_list.append(full_title_str.strip())
-                    if simple_title_list:
-                        gemini_suggestions_list_for_instruction = "\\n".join(simple_title_list)
+                    
+                    # This list is for the LLM to iterate over in its instructions
+                    processed_titles_for_llm_instruction = "\\n".join([f"{i+1}. {t}" for i, t in enumerate(simple_title_list)])
             else:
                 logger.info("No paper suggestions returned from Gemini.")
         except Exception as e_gemini_sugg:
@@ -528,7 +530,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     final_seen_content_snippets_for_semantic_check = [] # Store snippets of content for semantic dedupe
     final_seen_titles_normalized = set() # Store normalized titles for title-based dedupe
 
-    # Priority to targeted FAISS documents
+    # Priority to targeted FAISS documents (these are from Gemini's suggestions)
     for doc in targeted_faiss_documents:
         if len(final_rag_documents_for_prompt) >= AppConfig.N_RETRIEVED_DOCS:
             break
@@ -543,7 +545,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                 is_semantically_dupe = True
                 logger.info(f"Skipping (semantic duplicate) targeted FAISS doc: '{title}'")
                 break
-        
+                        
         if normalized_title not in final_seen_titles_normalized and not is_semantically_dupe:
             final_rag_documents_for_prompt.append(doc)
             final_seen_titles_normalized.add(normalized_title)
@@ -568,7 +570,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                     is_semantically_dupe = True
                     logger.info(f"Skipping (semantic duplicate) general FAISS doc: '{title}'")
                     break
-
+                            
             if normalized_title not in final_seen_titles_normalized and not is_semantically_dupe:
                 final_rag_documents_for_prompt.append(doc)
                 final_seen_titles_normalized.add(normalized_title)
@@ -576,27 +578,36 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             elif title and normalized_title in final_seen_titles_normalized:
                  logger.info(f"Skipping (title duplicate) general FAISS doc: '{title}'")
 
-    # --- Construct retrieved_context_str from final_rag_documents_for_prompt ---
+    # --- Construct retrieved_context_str_for_prompt from final_rag_documents_for_prompt ---
     retrieved_context_str_for_prompt = ""
-    retrieved_docs_for_log = []
-    if final_rag_documents_for_prompt:
+    retrieved_docs_for_log = [] # <--- ADD THIS LINE EXACTLY HERE
+
+    # Build the contextual_info_for_llm_about_papers if Gemini suggestions exist
+    if is_paper_query and unique_gemini_paper_suggestions and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
+        contextual_info_for_llm_about_papers = f"CONTEXT FOR PROVIDED PAPER TITLES:\\n{processed_titles_for_llm_instruction}\\n\\n"
+        logger.info("Gemini suggestions exist and will be included in the context.")
+    else:
+        contextual_info_for_llm_about_papers = ""
+        logger.info("No Gemini suggestions exist or they are being skipped.")
+
+    # Build general RAG context if not a paper query with specific context, or if paper query but no gemini suggestions
+    if not (is_paper_query and contextual_info_for_llm_about_papers) and final_rag_documents_for_prompt:
         context_parts = []
-        # --- MODIFIED TO ONLY INCLUDE THE FIRST RAG DOCUMENT FOR DEBUGGING ---
-        logger.info(f"DEBUG: Attempting to add only the first RAG document. Total available: {len(final_rag_documents_for_prompt)}")
-        doc_to_add = final_rag_documents_for_prompt[0] # Get the first document
-        
-        content = str(doc_to_add.page_content).strip() if doc_to_add.page_content is not None else ""
-        title = doc_to_add.metadata.get('title', 'Retrieved Document 1')
-        context_parts.append(f"Retrieved Document 1 (Title: {title}):\\n{content}")
-        retrieved_docs_for_log.append({"title": title, "content_preview": content[:100] + "..."})
-        logger.info(f"DEBUG: Added RAG Document Title: {title} to prompt context.")
-        # --- END OF MODIFICATION ---
+        # Current logic limits to 1 RAG doc for debugging, let's use AppConfig.N_RETRIEVED_DOCS
+        # for doc_to_add in final_rag_documents_for_prompt[:1]: # Original DEBUG limit
+        for i, doc_to_add in enumerate(final_rag_documents_for_prompt[:AppConfig.N_RETRIEVED_DOCS]):
+            content = str(doc_to_add.page_content).strip() if doc_to_add.page_content is not None else ""
+            title = doc_to_add.metadata.get('title', f'Retrieved Document {i+1}')
+            # Truncate content to avoid overly long prompts
+            max_content_len = 700 # Characters per RAG document in prompt
+            context_parts.append(f"Retrieved Document {i+1} (Title: {title}):\\n{content[:max_content_len]}{'...' if len(content) > max_content_len else ''}")
+            retrieved_docs_for_log.append({"title": title, "content_preview": content[:100] + "..."})
             
         if context_parts:
             retrieved_context_str_for_prompt = "\\n".join(context_parts)
-            logger.info(f"Final RAG context prepared with {len(retrieved_docs_for_log)} documents for LLM (DEBUG: only first doc).")
-    else:
-        logger.info("No RAG documents will be added to the LLM prompt.")
+            logger.info(f"General RAG context prepared with {len(retrieved_docs_for_log)} documents for LLM.")
+        else:
+            logger.info("No general RAG documents will be added to the LLM prompt.")
 
     # --- Stop sequences ---
     # These are common phrases the model might try to output that we want to stop.
@@ -609,7 +620,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
         "The user is asking", "The user wants to know",
         "This text follows", "The following is a", "This is a text about",
         "My goal is to", "I am an AI assistant", "As an AI",
-        "\\n\\nHuman:", "<|endoftext|>", "<|im_end|>", "</s>",
+        "\\n\\nHuman:", "<|endoftext|>", "<|im_end|>", "\\u202f",
         "STOP_ASSISTANT_PRIMING_PHRASE:" # Changed to avoid conflict with actual priming, just in case
     ]
     
@@ -634,28 +645,52 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
         "The response should be approximately 100-150 words for a general explanation, unless the query specifically asks for more detail or a list."
     )
 
-    if is_paper_query and gemini_suggestions_list_for_instruction:
-        # Radically simplified instruction to focus *only* on re-listing provided titles
-        paper_specific_instruction = (
-            f"You are an AI list formatting assistant. Your ONLY task is to reformat the paper titles provided below into a strict numbered list. Follow the rules precisely.\\n\\n"
-            f"PAPER TITLES TO REFORMAT:\\n{gemini_suggestions_list_for_instruction}\\n\\n"
-            f"FORMATTING RULES:\\n"
-            f"1. Your response MUST begin *exactly* with '1. Title: ' followed by the first paper title from the list above.\\n"
-            f"2. For every subsequent paper title from the list, start a new line and format it as: `[Number]. Title: [The Full Paper Title as Provided]`\\n"
-            f"3. Your response MUST ONLY contain this numbered list of titles. Nothing else before, and nothing else after.\\n"
-            f"4. Do NOT include any descriptions, summaries, your own thoughts, or any examples in your output.\\n"
-            f"5. Do NOT use any other formatting (like asterisks, hyphens, etc.) other than the specified `[Number]. Title: [Title]` format for each line."
-        )
-    else: 
-        paper_specific_instruction = (
-            "You are an AI assistant. The user is asking for paper suggestions or information about academic papers. "
-            "If you can provide paper titles and brief descriptions from your general knowledge, format them as a numbered list. "
-            "Example:\\n"
-            "1. Title: [Paper Title 1]\\n   Description: [Brief description of paper 1, its key findings, or relevance.]\\n"
-            "2. Title: [Paper Title 2]\\n   Description: [Brief description of paper 2, its key findings, or relevance.]\\n"
-            "Do NOT include conversational introductions or closings. Do NOT use meta-commentary. Do NOT self-reference. "
-            "Directly provide the list if you have suggestions, or state that you cannot provide specific paper suggestions from your current knowledge if that's the case."
-        )
+    if is_paper_query:
+        if processed_titles_for_llm_instruction and not DEBUG_SKIP_GEMINI_SUGGESTIONS: # Gemini provided titles
+            paper_specific_instruction = (
+                f"You are an AI research assistant. Your task is to process a list of provided paper titles. "
+                f"For each paper title, you must determine if relevant information is available in the 'CONTEXT FOR PROVIDED PAPER TITLES' section (which will appear later in this prompt). "
+                f"If information is found, use it for the abstract. If not, generate a plausible abstract using your own knowledge and reasoning.\\n\\n"
+                f"PAPER TITLES TO PROCESS:\\n{processed_titles_for_llm_instruction}\\n\\n"
+                f"INSTRUCTIONS FOR EACH PAPER TITLE:\\n"
+                f"1. Carefully read the paper title from the 'PAPER TITLES TO PROCESS' list.\\n"
+                f"2. Refer to the 'CONTEXT FOR PROVIDED PAPER TITLES' section in the full prompt. This section details findings from a local database search for each suggested title.\\n"
+                f"3. If the context for the current paper title indicates a 'Local Database Match' and provides a 'Retrieved Snippet':\\n"
+                f"   - Use this snippet as the abstract.\\n"
+                f"   - Format your response for this paper as:\\n"
+                f"     [Number]. Title: [Full Paper Title as provided in 'PAPER TITLES TO PROCESS']\\n"
+                f"        Abstract (from local database): [The retrieved snippet from context]\\n"
+                f"4. If the context indicates 'No specific abstract/document found' for the current paper title, or if the context is missing for this title:\\n"
+                f"   - Generate a concise, plausible-sounding abstract (1-3 sentences) for the paper based *only* on its title and your general knowledge. Employ a brief chain-of-thought for this generation.\\n"
+                f"   - Format your response for this paper as:\\n"
+                f"     [Number]. Title: [Full Paper Title as provided in 'PAPER TITLES TO PROCESS']\\n"
+                f"        Abstract (generated): [Your generated abstract]\\n"
+                f"        Reasoning (for generated abstract): [Briefly explain your thought process, e.g., 'Based on keywords X and Y, this paper likely discusses Z...'. If obvious, state 'Generated based on title analysis.']\\n"
+                f"5. If you absolutely cannot generate a meaningful abstract even from the title (after trying step 4), output:\\n"
+                f"     [Number]. Title: [Full Paper Title as provided in 'PAPER TITLES TO PROCESS']\\n"
+                f"        Abstract: Unable to provide an abstract for this title.\\n\\n"
+                f"OVERALL RESPONSE RULES:\\n"
+                f"- Your entire response MUST begin *exactly* with '1. Title: ' for the first paper and follow the numbering.\\n"
+                f"- ONLY include the numbered list of titles with their abstracts and reasoning as specified. No conversational fluff, intros, or outros.\\n"
+                f"- Ensure each paper's entry is distinct and follows the numbering from 'PAPER TITLES TO PROCESS'."
+            )
+        else: # Paper query, but no Gemini suggestions (or they are skipped), so LLM suggests its own
+            paper_specific_instruction = (
+                f"You are an AI research assistant. The user is asking for paper suggestions. "
+                f"Your task is to suggest up to 3-5 relevant academic paper titles based on the user's query and your general knowledge. "
+                f"For each paper you suggest, provide its title and then generate a brief, plausible-sounding abstract (1-2 sentences).\\n\\n"
+                # Add a note about checking local RAG context if it exists for its own suggestions
+                f"If general 'Retrieved Document' context is available in this prompt, you can check if any of your suggested titles coincidentally match any retrieved document titles. If so, you may use that content for the abstract, noting it as '(potentially related to retrieved context)'. Otherwise, generate the abstract from your knowledge.\\n\\n"
+                f"OUTPUT FORMATTING RULES FOR EACH SUGGESTED PAPER:\\n"
+                f"1. Start with the paper number, then 'Title: ', followed by the paper title you are suggesting. (e.g., '1. Title: [Suggested Paper Title]')\\n"
+                f"2. On the *next line*, indented with three spaces, write 'Abstract: ' followed by the concise (1-2 sentences) abstract. If using RAG context, you can note it.\\n"
+                f"3. If you cannot confidently generate a meaningful abstract for a title you suggest, write 'Abstract: General suggestion based on topic; specific abstract not available.'\\n\\n"
+                f"OVERALL RESPONSE RULES:\\n"
+                f"- Your entire response MUST begin *exactly* with '1. Title: ' for the first paper you suggest.\\n"
+                f"- Your response MUST ONLY contain the numbered list of your suggested titles with their corresponding abstracts. Nothing else before or after.\\n"
+                f"- If you cannot find any relevant papers to suggest from your knowledge, respond ONLY with the phrase: 'I am unable to suggest specific papers from my current knowledge based on your query.'\\n"
+                f"- Do NOT include conversational introductions, closings, meta-commentary, or self-references (unless stating inability to suggest papers as above)."
+            )
     
     # Determine which instruction to use
     query_lower = actual_user_question.lower()
@@ -675,22 +710,24 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     
     if not DEBUG_SKIP_AUGMENTATION:
         if not DEBUG_SKIP_RAG_CONTEXT: # Check RAG skip flag
-            if retrieved_context_str_for_prompt:
+            if is_paper_query and contextual_info_for_llm_about_papers and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
+                prompt_for_gemma += f"{contextual_info_for_llm_about_papers}\\n\\n" # Add the specific paper context
+            elif retrieved_context_str_for_prompt: # General RAG context
                 prompt_for_gemma += f"ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):\\n{retrieved_context_str_for_prompt}\\n\\n"
             else:
-                logger.info("DEBUG: No RAG context to add (retrieved_context_str_for_prompt is empty).")
+                logger.info("DEBUG: No RAG context (neither specific paper context nor general) to add.")
         else:
             logger.warning("DEBUG_SKIP_RAG_CONTEXT is TRUE: Skipping RAG context in Gemma prompt.")
 
-        if not DEBUG_SKIP_GEMINI_SUGGESTIONS: # Check Gemini skip flag
-            # The Gemini suggestions are now part of paper_specific_instruction if applicable,
-            # so we don't add gemini_suggested_papers_str_for_prompt separately here.
-            if is_paper_query and gemini_suggestions_list_for_instruction:
-                logger.info("DEBUG: Gemini suggestions were prepared for inclusion in paper_specific_instruction.")
-            elif is_paper_query:
-                logger.info("DEBUG: Paper query, but no Gemini suggestions were available to include in instruction.")
-        else:
-            logger.warning("DEBUG_SKIP_GEMINI_SUGGESTIONS is TRUE: Skipping Gemini suggestions processing for instruction.")
+        # Gemini suggestions are now primarily handled by processed_titles_for_llm_instruction within paper_specific_instruction
+        # No need to add a separate block for gemini_suggestions_list_for_instruction here
+        if is_paper_query and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
+            if processed_titles_for_llm_instruction:
+                logger.info("DEBUG: Gemini paper titles are included in 'PAPER TITLES TO PROCESS' within the instruction.")
+            else:
+                logger.info("DEBUG: Paper query, but no Gemini paper titles were prepared for the instruction.")
+        elif is_paper_query and DEBUG_SKIP_GEMINI_SUGGESTIONS:
+             logger.warning("DEBUG_SKIP_GEMINI_SUGGESTIONS is TRUE: Skipping Gemini suggestions for instruction.")
     else:
         logger.warning("DEBUG_SKIP_AUGMENTATION is TRUE: Skipping ALL augmentation in Gemma prompt.")
     
