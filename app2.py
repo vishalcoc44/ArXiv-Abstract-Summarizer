@@ -7,7 +7,7 @@ import requests # For direct HTTP calls to Gemini API
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-# import numpy as np # No longer needed here as we load pre-built FAISS
+import numpy as np # Add if not already present, for cosine similarity
 import logging # For improved logging
 import sqlite3
 import datetime
@@ -374,110 +374,355 @@ def get_gemini_paper_suggestions(user_query_for_gemini: str) -> list[dict[str, s
         logger.error(f"Error calling or parsing Gemini for paper suggestions: {e}", exc_info=True)
         return []
 
-# --- End Helper --- 
+# --- Helper function for semantic similarity (NEW) ---
+def are_texts_semantically_similar(text1: str, text2: str, threshold: float = 0.85) -> bool:
+    """Checks if two texts are semantically similar using embeddings and cosine similarity."""
+    if not text1 or not text2:
+        return False
+    if not embeddings_model:
+        logger.warning("Embeddings model not loaded. Cannot perform semantic similarity check.")
+        return False # Fallback: treat as not similar if model is missing
+
+    try:
+        # Ensure texts are not excessively long for embedding, truncate if necessary
+        # This depends on the embedding model's limits, e.g., 512 tokens for sentence-transformers
+        # A simple character limit might be a pragmatic first step.
+        max_len_for_emb = 1000 # Characters, rough estimate
+        text1_emb = embeddings_model.embed_query(text1[:max_len_for_emb])
+        text2_emb = embeddings_model.embed_query(text2[:max_len_for_emb])
+
+        # Cosine similarity calculation
+        # Requires numpy. A more robust implementation would handle potential errors here.
+        vec1 = np.array(text1_emb)
+        vec2 = np.array(text2_emb)
+        
+        # Ensure vectors are 1D for dot product and norm calculation
+        if vec1.ndim > 1: vec1 = vec1.squeeze()
+        if vec2.ndim > 1: vec2 = vec2.squeeze()
+        
+        # Check for zero vectors (e.g. from empty strings after processing)
+        if np.all(vec1 == 0) or np.all(vec2 == 0):
+            return False # Or handle as per requirements, e.g. identical if both are zero vectors from empty strings
+
+        similarity = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+        
+        logger.debug(f"Semantic similarity between snippets: {similarity:.4f}")
+        return similarity >= threshold
+    except Exception as e:
+        logger.error(f"Error calculating semantic similarity: {e}", exc_info=True)
+        return False # Fallback on error
 
 # UNCOMMENTED generate_local_rag_response
 def generate_local_rag_response(user_query_with_history: str, chat_id=None):
-    # --- START OF REPLACEMENT --- 
-    # THIS ENTIRE FUNCTION BODY IS BEING REPLACED WITH A SIMPLIFIED VERSION.
-    # ALL PREVIOUS LOGIC (RAG, COMPLEX AUGMENTATION) IS TEMPORARILY REMOVED.
+    DEBUG_SKIP_AUGMENTATION = False 
+    DEBUG_SKIP_RAG_CONTEXT = True    # << KEEP RAG SKIPPED to avoid empty responses for now
+    DEBUG_SKIP_GEMINI_SUGGESTIONS = False # << ENSURE GEMINI SUGGESTIONS ARE ON
 
-    cancel_event = active_cancellation_events.get(chat_id)
-    if not cancel_event:
-        logger.warning(f"No cancel_event for chat_id {chat_id} in local_rag (simplified). Creating dummy.")
-        cancel_event = threading.Event()
+    if not systems_status["local_llm_loaded"] or local_llm is None:
+        logger.warning("Local LLM not loaded, yielding error message.")
+        yield "The local GGUF model is not loaded. Cannot generate a response."
+        return
+
+    logger.info(f"Received in generate_local_rag_response: {user_query_with_history}")
+
+    lines = user_query_with_history.strip().split('\\n')
+    actual_user_question = lines[-1] if lines else ""
+    conversation_log_for_prompt = "\\n".join(lines[:-1]) if len(lines) > 1 else "No previous conversation."
+
+    # --- Phase 1: General RAG (FAISS Document Retrieval based on user query) ---
+    general_retrieved_documents_from_faiss = [] # Stores Langchain Document objects
+    if systems_status["faiss_index_loaded"] and faiss_index and actual_user_question:
+        try:
+            logger.info(f"Performing general FAISS similarity search for: '{actual_user_question[:100]}...'")
+            retrieved_documents = faiss_index.similarity_search(actual_user_question, k=AppConfig.N_RETRIEVED_DOCS + 2) 
+            if retrieved_documents:
+                seen_titles = set()
+                temp_unique_docs = []
+                for doc in retrieved_documents:
+                    title = doc.metadata.get('title', '').strip()
+                    normalized_title = title.lower()
+                    if title and normalized_title not in seen_titles:
+                        temp_unique_docs.append(doc)
+                        seen_titles.add(normalized_title)
+                    elif not title:
+                        temp_unique_docs.append(doc)
+                general_retrieved_documents_from_faiss = temp_unique_docs # These are already somewhat deduplicated by title
+                logger.info(f"General FAISS search initially retrieved {len(general_retrieved_documents_from_faiss)} documents (after basic title dedupe).")
+            else:
+                logger.info("No documents retrieved from general FAISS search for the query.")
+        except Exception as e_faiss:
+            logger.error(f"Error during general FAISS retrieval: {e_faiss}", exc_info=True)
+    else:
+        logger.info("FAISS index not loaded or query is empty. Skipping general RAG retrieval.")
+
+    query_lower = actual_user_question.lower()
+    is_paper_query = any(keyword in query_lower for keyword in ["paper", "suggest", "recommend", "article", "publication", "study", "research"])
+
+    # --- Phase 1: Gemini Paper Candidate Generation (Task 2 - Part 1) ---
+    unique_gemini_paper_suggestions = [] 
+    gemini_suggestions_list_for_instruction = "" 
+
+    if is_paper_query and systems_status["gemini_model_configured"]:
+        logger.info(f"Paper query detected. Attempting to get suggestions from Gemini for: '{actual_user_question[:100]}...'")
+        try:
+            gemini_papers_raw = get_gemini_paper_suggestions(actual_user_question)
+            if gemini_papers_raw:
+                seen_gemini_titles = set()
+                for paper in gemini_papers_raw:
+                    title = paper.get('title', '').strip()
+                    normalized_title = title.lower()
+                    if title and normalized_title not in seen_gemini_titles:
+                        unique_gemini_paper_suggestions.append(paper) # Store the dicts
+                        seen_gemini_titles.add(normalized_title)
+                
+                if unique_gemini_paper_suggestions:
+                    logger.info(f"Gemini suggested {len(unique_gemini_paper_suggestions)} unique papers initially.")
+                    # Create a simple list of titles (with arXiv if present) for the instruction
+                    simple_title_list = []
+                    for paper in unique_gemini_paper_suggestions:
+                        title = paper.get('title', '')
+                        arxiv_id = paper.get('arxiv_id')
+                        full_title_str = f"{title}{f' (arXiv:{arxiv_id})' if arxiv_id else ''}"
+                        simple_title_list.append(full_title_str.strip())
+                    if simple_title_list:
+                        gemini_suggestions_list_for_instruction = "\\n".join(simple_title_list)
+            else:
+                logger.info("No paper suggestions returned from Gemini.")
+        except Exception as e_gemini_sugg:
+            logger.error(f"Error getting paper suggestions from Gemini: {e_gemini_sugg}", exc_info=True)
+    elif is_paper_query:
+        logger.info("Paper query, but Gemini is not configured. Skipping Gemini suggestions.")
+
+    # --- Phase 2: Targeted RAG (FAISS Retrieval based on Gemini Suggestions) ---
+    targeted_faiss_documents = []
+    if systems_status["faiss_index_loaded"] and faiss_index and unique_gemini_paper_suggestions:
+        logger.info(f"Performing targeted FAISS search for {len(unique_gemini_paper_suggestions)} Gemini suggestions.")
+        seen_targeted_faiss_titles_normalized = set() # Deduplicate titles found via this targeted search
+        for paper_suggestion in unique_gemini_paper_suggestions:
+            title_to_search = paper_suggestion.get("title")
+            if title_to_search:
+                try:
+                    docs = faiss_index.similarity_search(title_to_search, k=1) # Fetch top 1 for precision
+                    if docs:
+                        # Check if this doc is distinct enough before adding
+                        doc_from_targeted_search = docs[0]
+                        doc_title = doc_from_targeted_search.metadata.get("title", "").strip()
+                        normalized_doc_title = doc_title.lower()
+
+                        if normalized_doc_title and normalized_doc_title not in seen_targeted_faiss_titles_normalized:
+                            # Further check: is the found FAISS title semantically similar to the Gemini title?
+                            if are_texts_semantically_similar(title_to_search, doc_title, threshold=0.85): # Threshold for title matching
+                                targeted_faiss_documents.append(doc_from_targeted_search)
+                                seen_targeted_faiss_titles_normalized.add(normalized_doc_title)
+                                logger.debug(f"Targeted FAISS found relevant doc for '{title_to_search}': '{doc_title}'")
+                            else:
+                                logger.debug(f"Targeted FAISS found doc '{doc_title}' for '{title_to_search}', but titles not semantically similar enough.")
+                        elif doc_title:
+                             logger.debug(f"Targeted FAISS found doc '{doc_title}' for '{title_to_search}', but it was a title-duplicate of another targeted result.")
+                except Exception as e_targeted_faiss:
+                    logger.error(f"Error during targeted FAISS search for title '{title_to_search}': {e_targeted_faiss}", exc_info=True)
+        logger.info(f"Retrieved {len(targeted_faiss_documents)} documents from targeted FAISS search.")
+
+    # --- Combine and Deduplicate RAG Context (Task 1 Enhancement) ---
+    final_rag_documents_for_prompt = []
+    final_seen_content_snippets_for_semantic_check = [] # Store snippets of content for semantic dedupe
+    final_seen_titles_normalized = set() # Store normalized titles for title-based dedupe
+
+    # Priority to targeted FAISS documents
+    for doc in targeted_faiss_documents:
+        if len(final_rag_documents_for_prompt) >= AppConfig.N_RETRIEVED_DOCS:
+            break
+        title = doc.metadata.get("title", "").strip()
+        normalized_title = title.lower()
+        page_content_str = str(doc.page_content if doc.page_content is not None else "")
+        content_snippet_for_check = page_content_str[:300] # Use a larger snippet for semantic check
+
+        is_semantically_dupe = False
+        for existing_snippet in final_seen_content_snippets_for_semantic_check:
+            if are_texts_semantically_similar(content_snippet_for_check, existing_snippet, threshold=0.90): # Stricter for pre-LLM
+                is_semantically_dupe = True
+                logger.info(f"Skipping (semantic duplicate) targeted FAISS doc: '{title}'")
+                break
+        
+        if normalized_title not in final_seen_titles_normalized and not is_semantically_dupe:
+            final_rag_documents_for_prompt.append(doc)
+            final_seen_titles_normalized.add(normalized_title)
+            final_seen_content_snippets_for_semantic_check.append(content_snippet_for_check)
+        elif title and normalized_title in final_seen_titles_normalized:
+            logger.info(f"Skipping (title duplicate) targeted FAISS doc: '{title}'")
+
+    # Add general RAG documents if space allows and they are distinct
+    remaining_slots = AppConfig.N_RETRIEVED_DOCS - len(final_rag_documents_for_prompt)
+    if remaining_slots > 0:
+        for doc in general_retrieved_documents_from_faiss:
+            if len(final_rag_documents_for_prompt) >= AppConfig.N_RETRIEVED_DOCS:
+                break
+            title = doc.metadata.get("title", "").strip()
+            normalized_title = title.lower()
+            page_content_str = str(doc.page_content if doc.page_content is not None else "")
+            content_snippet_for_check = page_content_str[:300]
+
+            is_semantically_dupe = False
+            for existing_snippet in final_seen_content_snippets_for_semantic_check:
+                if are_texts_semantically_similar(content_snippet_for_check, existing_snippet, threshold=0.90):
+                    is_semantically_dupe = True
+                    logger.info(f"Skipping (semantic duplicate) general FAISS doc: '{title}'")
+                    break
+
+            if normalized_title not in final_seen_titles_normalized and not is_semantically_dupe:
+                final_rag_documents_for_prompt.append(doc)
+                final_seen_titles_normalized.add(normalized_title)
+                final_seen_content_snippets_for_semantic_check.append(content_snippet_for_check)
+            elif title and normalized_title in final_seen_titles_normalized:
+                 logger.info(f"Skipping (title duplicate) general FAISS doc: '{title}'")
+
+    # --- Construct retrieved_context_str from final_rag_documents_for_prompt ---
+    retrieved_context_str_for_prompt = ""
+    retrieved_docs_for_log = []
+    if final_rag_documents_for_prompt:
+        context_parts = []
+        # --- MODIFIED TO ONLY INCLUDE THE FIRST RAG DOCUMENT FOR DEBUGGING ---
+        logger.info(f"DEBUG: Attempting to add only the first RAG document. Total available: {len(final_rag_documents_for_prompt)}")
+        doc_to_add = final_rag_documents_for_prompt[0] # Get the first document
+        
+        content = str(doc_to_add.page_content).strip() if doc_to_add.page_content is not None else ""
+        title = doc_to_add.metadata.get('title', 'Retrieved Document 1')
+        context_parts.append(f"Retrieved Document 1 (Title: {title}):\\n{content}")
+        retrieved_docs_for_log.append({"title": title, "content_preview": content[:100] + "..."})
+        logger.info(f"DEBUG: Added RAG Document Title: {title} to prompt context.")
+        # --- END OF MODIFICATION ---
+            
+        if context_parts:
+            retrieved_context_str_for_prompt = "\\n".join(context_parts)
+            logger.info(f"Final RAG context prepared with {len(retrieved_docs_for_log)} documents for LLM (DEBUG: only first doc).")
+    else:
+        logger.info("No RAG documents will be added to the LLM prompt.")
+
+    # --- Stop sequences ---
+    # These are common phrases the model might try to output that we want to stop.
+    # This list can be expanded based on observed model behavior.
+    stop_sequences_general = [
+        "User:", "User Query:", "USER:", "ASSISTANT:", "Assistant:", "System:", 
+        "\\nUser:", "\\nUSER:", "\\nASSISTANT:", "\\nAssistant:", "\\nSystem:",
+        "Context:", "CONTEXT:", "Answer:", "ANSWER:", "Note:", "Response:",
+        "In this response,", "In summary,", "To summarize,", "Let's expand on",
+        "The user is asking", "The user wants to know",
+        "This text follows", "The following is a", "This is a text about",
+        "My goal is to", "I am an AI assistant", "As an AI",
+        "\\n\\nHuman:", "<|endoftext|>", "<|im_end|>", "</s>",
+        "STOP_ASSISTANT_PRIMING_PHRASE:" # Changed to avoid conflict with actual priming, just in case
+    ]
+    
+    generation_params_general = {
+        "temperature": 0.2, 
+        "top_p": 0.8,       
+        "top_k": 40,        
+        "repeat_penalty": 1.15, 
+        "max_tokens": 500,   # Temporarily increased for debugging empty response
+        "stop": stop_sequences_general
+    }
+
+    # --- Role and Task Definition for General Knowledge ---
+    # This prompt tries to make Gemma concise and avoid meta-commentary or conversational fluff.
+    general_knowledge_instruction = (
+        "You are a concise and factual AI assistant. Your primary goal is to provide direct answers or explanations based on your training data and the provided conversation log. "
+        "Focus solely on the user's query. Do NOT include conversational introductions or closings like 'Hello!', 'Sure!', 'Certainly!', 'Okay, here is...', 'I hope this helps!', or 'Let me know if you have other questions.' "
+        "Do NOT engage in meta-commentary (e.g., 'In this response, I will...', 'I will now explain...', 'Based on the context...'). "
+        "Avoid any self-reference (e.g., 'As an AI assistant...', 'My purpose is to...'). "
+        "Avoid section headers or titles in your response (e.g., 'Explanation:', 'Details:', 'Summary:'). "
+        "If the conversation log is relevant, use it to understand the context of the current query. "
+        "The response should be approximately 100-150 words for a general explanation, unless the query specifically asks for more detail or a list."
+    )
+
+    if is_paper_query and gemini_suggestions_list_for_instruction:
+        # Radically simplified instruction to focus *only* on re-listing provided titles
+        paper_specific_instruction = (
+            f"You are an AI list formatting assistant. Your ONLY task is to reformat the paper titles provided below into a strict numbered list. Follow the rules precisely.\\n\\n"
+            f"PAPER TITLES TO REFORMAT:\\n{gemini_suggestions_list_for_instruction}\\n\\n"
+            f"FORMATTING RULES:\\n"
+            f"1. Your response MUST begin *exactly* with '1. Title: ' followed by the first paper title from the list above.\\n"
+            f"2. For every subsequent paper title from the list, start a new line and format it as: `[Number]. Title: [The Full Paper Title as Provided]`\\n"
+            f"3. Your response MUST ONLY contain this numbered list of titles. Nothing else before, and nothing else after.\\n"
+            f"4. Do NOT include any descriptions, summaries, your own thoughts, or any examples in your output.\\n"
+            f"5. Do NOT use any other formatting (like asterisks, hyphens, etc.) other than the specified `[Number]. Title: [Title]` format for each line."
+        )
+    else: 
+        paper_specific_instruction = (
+            "You are an AI assistant. The user is asking for paper suggestions or information about academic papers. "
+            "If you can provide paper titles and brief descriptions from your general knowledge, format them as a numbered list. "
+            "Example:\\n"
+            "1. Title: [Paper Title 1]\\n   Description: [Brief description of paper 1, its key findings, or relevance.]\\n"
+            "2. Title: [Paper Title 2]\\n   Description: [Brief description of paper 2, its key findings, or relevance.]\\n"
+            "Do NOT include conversational introductions or closings. Do NOT use meta-commentary. Do NOT self-reference. "
+            "Directly provide the list if you have suggestions, or state that you cannot provide specific paper suggestions from your current knowledge if that's the case."
+        )
+    
+    # Determine which instruction to use
+    query_lower = actual_user_question.lower()
+    is_paper_query = any(keyword in query_lower for keyword in ["paper", "suggest", "recommend", "article", "publication", "study", "research"])
+
+    if is_paper_query:
+        instruction_to_use = paper_specific_instruction
+        logger.info("Using paper-specific instruction for Gemma.")
+    else:
+        instruction_to_use = general_knowledge_instruction
+        logger.info("Using general knowledge instruction for Gemma.")
+
+    # --- Constructing the Final Prompt for Gemma ---
+    prompt_for_gemma = f"{instruction_to_use}\\n\\n"
+    if conversation_log_for_prompt and conversation_log_for_prompt != "No previous conversation.":
+        prompt_for_gemma += f"CONVERSATION LOG:\\n{conversation_log_for_prompt}\\n\\n"
+    
+    if not DEBUG_SKIP_AUGMENTATION:
+        if not DEBUG_SKIP_RAG_CONTEXT: # Check RAG skip flag
+            if retrieved_context_str_for_prompt:
+                prompt_for_gemma += f"ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):\\n{retrieved_context_str_for_prompt}\\n\\n"
+            else:
+                logger.info("DEBUG: No RAG context to add (retrieved_context_str_for_prompt is empty).")
+        else:
+            logger.warning("DEBUG_SKIP_RAG_CONTEXT is TRUE: Skipping RAG context in Gemma prompt.")
+
+        if not DEBUG_SKIP_GEMINI_SUGGESTIONS: # Check Gemini skip flag
+            # The Gemini suggestions are now part of paper_specific_instruction if applicable,
+            # so we don't add gemini_suggested_papers_str_for_prompt separately here.
+            if is_paper_query and gemini_suggestions_list_for_instruction:
+                logger.info("DEBUG: Gemini suggestions were prepared for inclusion in paper_specific_instruction.")
+            elif is_paper_query:
+                logger.info("DEBUG: Paper query, but no Gemini suggestions were available to include in instruction.")
+        else:
+            logger.warning("DEBUG_SKIP_GEMINI_SUGGESTIONS is TRUE: Skipping Gemini suggestions processing for instruction.")
+    else:
+        logger.warning("DEBUG_SKIP_AUGMENTATION is TRUE: Skipping ALL augmentation in Gemma prompt.")
+    
+    prompt_for_gemma += f"USER QUERY: {actual_user_question}\\n\\nASSISTANT'S FACTUAL ANSWER:"
+
+    logger.info(f"Final Prompt for Gemma (first 300 chars): {prompt_for_gemma[:300]}...")
+    logger.info(f"Full Prompt for Gemma:\\n{prompt_for_gemma}") # Uncommented for debugging
+    if retrieved_docs_for_log:
+        logger.info(f"RAG documents added to prompt: {json.dumps(retrieved_docs_for_log, indent=2)}")
+    if unique_gemini_paper_suggestions: # Log what Gemini originally suggested
+        logger.info(f"Gemini initially suggested papers: {json.dumps(unique_gemini_paper_suggestions, indent=2)}")
+    logger.info(f"Generation parameters for Gemma: {generation_params_general}")
 
     try:
-        parts = user_query_with_history.split("User:")
-        actual_user_question = parts[-1].strip() if parts else user_query_with_history
-        logger.info(f"Local Model (General Knowledge Only Path) for query: '{actual_user_question[:100]}...'")
-
-        # Determine if it's a paper suggestion query (for prompting nuances)
-        is_paper_suggestion_query = False
-        normalized_question_lower = actual_user_question.lower()
-        # Simplified keywords for this baseline version
-        if "paper" in normalized_question_lower and any(k in normalized_question_lower for k in ["top", "list", "suggest", "find"]):
-                    is_paper_suggestion_query = True
-        logger.info(f"Query analysis (General Knowledge Only Path): is_paper_suggestion_query={is_paper_suggestion_query}")
-
-        gemma_output_chunks = []
+        stream = local_llm.create_chat_completion( # Corrected method call
+            messages=[{"role": "user", "content": prompt_for_gemma}],
+            **generation_params_general,
+            stream=True
+        )
         
-        # --- Always use General Knowledge for this simplified version ---
-        logger.info("Attempting local model general knowledge response.")
+        full_response = ""
+        for chunk in stream:
+            delta_content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+            if delta_content:
+                yield delta_content
+                full_response += delta_content
         
-        general_knowledge_prompt = ""
-        role_and_task = "You are a concise and factual AI assistant. Your task is to directly answer the user's query."
-        negative_constraints = "Provide a comprehensive yet concise answer, aiming for approximately 100-150 words for a general explanation. Ensure core concepts are well-explained. Do NOT include any conversational introductions or conclusions, any form of self-reference or meta-commentary (e.g., 'In this response...', 'This answer provides...'), section headers (e.g., 'Answer:', 'Context:'), questions back to the user, or any repetition of the user's query. Be factual and get straight to the point."
+        logger.info(f"Gemma full response (simplified): {full_response.strip()}")
 
-        if is_paper_suggestion_query:
-            paper_specific_instruction = "If the query is about academic papers, list relevant titles and very brief, factual descriptions if known from your general knowledge. Present this information clearly and without conversational fluff."
-            general_knowledge_prompt = f"{role_and_task} {paper_specific_instruction} {negative_constraints}\n\nUSER'S QUESTION:\n{actual_user_question}\n\nASSISTANT'S FACTUAL ANSWER:"
-        else:
-            general_knowledge_prompt = f"{role_and_task} {negative_constraints}\n\nUSER'S QUESTION:\n{actual_user_question}\n\nASSISTANT'S FACTUAL ANSWER:"
-        
-        logger.debug(f"Local general knowledge prompt (Direct Instruction Path v2) (first 300 chars): {general_knowledge_prompt[:300]}...")
-        
-        generation_params_general = {
-            'max_tokens': AppConfig.LLAMA_MAX_TOKENS if hasattr(AppConfig, 'LLAMA_MAX_TOKENS') else 1024, 
-            'temperature': 0.3,  
-            'top_p': 0.7,    
-            'top_k': 20,     
-            'repeat_penalty': 1.2, 
-            'mirostat_mode': 0, 
-            'mirostat_tau': 5.0, 
-            'mirostat_eta': 0.1, 
-            'stop': [
-                "<|im_end|>", "\\nUser:", "\\nHuman:", "Human:", "Assistant:",
-                "\\nQuestion:", "\\nQuery:", "Factual Answer:", "ASSISTANT'S FACTUAL ANSWER:", "USER'S QUESTION:",
-                "Let's expand on this response", "Let's add some additional context",
-                "Let's add a question", "Here are some additional details",
-                "Here's an expansion", "To elaborate further",
-                "Answer:", "Context:", 
-                "In this response, I have provided", "In this response I have provided",
-                "This response provides an overview",
-                "Please also avoid overly technical or jargon-heavy language where appropriate.",
-                "This text follows standard conventions for informative responses.",
-                "All response fragments are well-structured adn completed successfully.",
-                "All response fragments are well-structured and completed successfully.",
-                "Any future contributions might include",
-                "This approach shows a common area to apply improvements",
-                "---N\nUser Query:"
-            ], 
-            'stream': True,
-            'echo': False
-        }
-
-        try:
-            logger.info("Invoking local LLM for general knowledge response...")
-            output_stream = local_llm(general_knowledge_prompt, **generation_params_general)
-            for chunk in output_stream:
-                if cancel_event.is_set(): 
-                    logger.info(f"General knowledge generation cancelled for chat_id {chat_id}.")
-                    yield CANCEL_MESSAGE
-                    return
-                text_chunk = chunk['choices'][0].get('text', '')
-                if text_chunk: 
-                    gemma_output_chunks.append(text_chunk)
-                    yield text_chunk
-            
-            if not gemma_output_chunks or not "".join(gemma_output_chunks).strip():
-                logger.warning("Local model general knowledge response was empty after streaming.")
-                yield "Sorry, I could not generate a response using the local model's general knowledge at this time."
-                return
-            logger.info("Local model general knowledge response successfully generated and streamed.")
-
-        except Exception as e_llm_call:
-            logger.error(f"Exception during local LLM call (general knowledge path): {e_llm_call}", exc_info=True)
-            yield "Sorry, an error occurred while the local model was generating a response."
-            return
-
-        final_response_for_log = "".join(gemma_output_chunks)
-        logger.info(f"Completed generate_local_rag_response (GK Path). Full response length: {len(final_response_for_log)}. Start: '{final_response_for_log[:100]}...'")
-
-    except Exception as e_outer_wrapper:
-        logger.error(f"Outer exception in generate_local_rag_response (GK Path): {e_outer_wrapper}", exc_info=True)
-        yield "Sorry, an unexpected server error occurred while preparing to generate a response with the local model."
-    # --- END OF REPLACEMENT ---
+    except Exception as e:
+        logger.error(f"Error during local LLM generation (simplified path): {e}", exc_info=True)
+        yield f"Error generating response from local model: {str(e)}"
 
 # --- Flask Routes ---
 @app.route('/')
