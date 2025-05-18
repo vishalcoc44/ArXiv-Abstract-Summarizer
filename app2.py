@@ -15,6 +15,7 @@ import colorama
 import json # Add this import at the top of the file if not already there
 import re # For parsing Gemini response
 import atexit # For controlled cleanup
+import threading # Add this for cancellation events
 
 # Initialize colorama carefully for Windows
 # colorama.init() # Original
@@ -53,6 +54,10 @@ class AppConfig:
     FLASK_HOST = '0.0.0.0'
     FLASK_PORT = 5001
     DATABASE_URL = 'chat_app.db'
+
+# --- Global dictionary for cancellation events ---
+active_cancellation_events = {} # Key: chat_id, Value: threading.Event()
+CANCEL_MESSAGE = "\\n\\n[LLM generation cancelled by user.]"
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, 
@@ -225,6 +230,12 @@ def generate_gemini_response(prompt, chat_id=None):
         yield "Gemini API is not configured. Cannot generate response."
         return
 
+    cancel_event = active_cancellation_events.get(chat_id)
+    if not cancel_event: # Should ideally always be there if called from /api/chat
+        logger.warning(f"No cancel_event found for chat_id {chat_id} in generate_gemini_response. Generation will not be cancellable.")
+        # Create a dummy event if not passed, so it doesn't crash, but won't be externally cancellable
+        cancel_event = threading.Event()
+
     headers = {
         "Content-Type": "application/json",
     }
@@ -255,6 +266,12 @@ def generate_gemini_response(prompt, chat_id=None):
         client_sse_event_prefix = "data: " # SSE events are prefixed with "data: "
         
         for line in response.iter_lines():
+            if cancel_event.is_set():
+                logger.info(f"Gemini generation cancelled for chat_id {chat_id}.")
+                yield CANCEL_MESSAGE
+                response.close() # Ensure the underlying connection is closed
+                return
+
             if line:
                 decoded_line = line.decode('utf-8')
                 if decoded_line.startswith(client_sse_event_prefix):
@@ -305,6 +322,9 @@ def generate_gemini_response(prompt, chat_id=None):
     except Exception as e:
         logger.error(f"Error processing Gemini response: {e}", exc_info=True)
         yield "Sorry, I encountered an unexpected error trying to connect to the Gemini service."
+    finally:
+        if 'response' in locals() and response is not None:
+            response.close() # Ensure response is closed in all exit paths
 
 # --- Helper function to get paper suggestions from Gemini ---
 def get_gemini_paper_suggestions(user_query_for_gemini: str) -> list[dict[str, str | None]]:
@@ -358,135 +378,106 @@ def get_gemini_paper_suggestions(user_query_for_gemini: str) -> list[dict[str, s
 
 # UNCOMMENTED generate_local_rag_response
 def generate_local_rag_response(user_query_with_history: str, chat_id=None):
-    if not systems_status["local_llm_loaded"]:
-        logger.warning("Attempted to use local model for RAG, but it's not loaded.")
-        yield "Local model is not loaded. Cannot generate RAG response."
-        return
-    if not systems_status["faiss_index_loaded"]:
-        logger.warning("Attempted to use RAG, but FAISS index is not loaded.")
-        yield "RAG components (FAISS index) are not available. Cannot generate RAG response."
-        return
+    # --- START OF REPLACEMENT --- 
+    # THIS ENTIRE FUNCTION BODY IS BEING REPLACED WITH A SIMPLIFIED VERSION.
+    # ALL PREVIOUS LOGIC (RAG, COMPLEX AUGMENTATION) IS TEMPORARILY REMOVED.
+
+    cancel_event = active_cancellation_events.get(chat_id)
+    if not cancel_event:
+        logger.warning(f"No cancel_event for chat_id {chat_id} in local_rag (simplified). Creating dummy.")
+        cancel_event = threading.Event()
 
     try:
-        actual_user_question = user_query_with_history
-        if isinstance(user_query_with_history, str) and "\nUser: " in user_query_with_history:
-            parts = user_query_with_history.split("\nUser: ")
-            if parts:
-                actual_user_question = parts[-1]
-        logger.info(f"Processing RAG for actual user question: '{actual_user_question[:100]}...'")
+        parts = user_query_with_history.split("User:")
+        actual_user_question = parts[-1].strip() if parts else user_query_with_history
+        logger.info(f"Local Model (General Knowledge Only Path) for query: '{actual_user_question[:100]}...'")
 
+        # Determine if it's a paper suggestion query (for prompting nuances)
         is_paper_suggestion_query = False
-        keywords_for_paper_suggestion = [
-            "top papers", "list papers", "recommend papers", "find papers on", 
-            "literature on", "key papers in", "recent papers in", "suggest papers",
-            "summarize papers on", "what papers discuss"
-        ]
-        if any(keyword in actual_user_question.lower() for keyword in keywords_for_paper_suggestion):
-            is_paper_suggestion_query = True
-            logger.info(f"Query identified as potentially needing external paper suggestions: '{actual_user_question}'")
+        normalized_question_lower = actual_user_question.lower()
+        # Simplified keywords for this baseline version
+        if "paper" in normalized_question_lower and any(k in normalized_question_lower for k in ["top", "list", "suggest", "find"]):
+                    is_paper_suggestion_query = True
+        logger.info(f"Query analysis (General Knowledge Only Path): is_paper_suggestion_query={is_paper_suggestion_query}")
 
-        gemini_suggested_papers = [] 
+        gemma_output_chunks = []
+        
+        # --- Always use General Knowledge for this simplified version ---
+        logger.info("Attempting local model general knowledge response.")
+        
+        general_knowledge_prompt = ""
+        role_and_task = "You are a concise and factual AI assistant. Your task is to directly answer the user's query."
+        negative_constraints = "Provide a comprehensive yet concise answer, aiming for approximately 100-150 words for a general explanation. Ensure core concepts are well-explained. Do NOT include any conversational introductions or conclusions, any form of self-reference or meta-commentary (e.g., 'In this response...', 'This answer provides...'), section headers (e.g., 'Answer:', 'Context:'), questions back to the user, or any repetition of the user's query. Be factual and get straight to the point."
+
         if is_paper_suggestion_query:
-            gemini_suggested_papers = get_gemini_paper_suggestions(actual_user_question)
-        
-        final_context_docs = []
-        verified_gemini_papers_metadata = []
-
-        if gemini_suggested_papers:
-            logger.info(f"Checking local FAISS for {len(gemini_suggested_papers)} suggestions from Gemini...")
-            for paper_info in gemini_suggested_papers:
-                query_text = paper_info['title']
-                retrieved_docs_for_title = faiss_index.similarity_search_with_score(query_text, k=1)
-                
-                if retrieved_docs_for_title:
-                    doc, score = retrieved_docs_for_title[0]
-                    SIMILARITY_THRESHOLD_L2 = 1.0 
-                    if score <= SIMILARITY_THRESHOLD_L2:
-                        logger.info(f"Found potential local match for Gemini suggestion '{paper_info['title']}' with score {score:.4f}. Adding to context.")
-                        final_context_docs.append(doc) 
-                        if doc.metadata: # Ensure metadata exists
-                           verified_gemini_papers_metadata.append(doc.metadata)
-                        if len(final_context_docs) >= AppConfig.N_RETRIEVED_DOCS * 2:
-                            break 
-                    else:
-                        logger.info(f"Local match for '{paper_info['title']}' found but score {score:.4f} too low (threshold {SIMILARITY_THRESHOLD_L2}).")
-            
-            if final_context_docs:
-                logger.info(f"Found {len(final_context_docs)} documents in local FAISS corresponding to Gemini's suggestions.")
-            else:
-                logger.info("None of Gemini's suggestions were found with high confidence in local FAISS.")
-
-        if not is_paper_suggestion_query or not final_context_docs:
-            if not final_context_docs: 
-                logger.info(f"Performing general FAISS similarity search with query: '{actual_user_question[:100]}...'")
-                retrieved_docs_general = faiss_index.similarity_search(actual_user_question, k=AppConfig.N_RETRIEVED_DOCS)
-                if retrieved_docs_general:
-                    final_context_docs.extend(retrieved_docs_general)
-
-        context_for_llm = "No relevant context found in the local knowledge base for your query."
-        if final_context_docs:
-            unique_docs_by_content = {}
-            for doc in final_context_docs:
-                if doc.page_content not in unique_docs_by_content:
-                    unique_docs_by_content[doc.page_content] = doc
-            final_context_docs = list(unique_docs_by_content.values())            
-            context_for_llm = "\n\n---\n\n".join([doc.page_content for doc in final_context_docs])
-
-        prompt_introduction = ""
-        if verified_gemini_papers_metadata:
-            titles_found_locally = [meta.get('title', '[Unknown Title]') for meta in verified_gemini_papers_metadata if meta]
-            if titles_found_locally:
-                prompt_introduction = (
-                    f"An external knowledge source suggested the following papers related to your query: '{actual_user_question}'. "
-                    f"I have found information for these in my local knowledge base: \n- " + "\n- ".join(titles_found_locally) +
-                    f"\n\nPlease use the context below, which contains details for these locally found papers, to answer the user's question."
-                )
-            else:
-                prompt_introduction = "I consulted an external knowledge source, but couldn't verify its suggestions in my local data. Using general local knowledge instead:"
+            paper_specific_instruction = "If the query is about academic papers, list relevant titles and very brief, factual descriptions if known from your general knowledge. Present this information clearly and without conversational fluff."
+            general_knowledge_prompt = f"{role_and_task} {paper_specific_instruction} {negative_constraints}\n\nUSER'S QUESTION:\n{actual_user_question}\n\nASSISTANT'S FACTUAL ANSWER:"
         else:
-            prompt_introduction = (
-                "You are a factual assistant. Your primary goal is to answer the user's question based *only* on the provided \"Context\" below.\n"
-                "- If the context contains the answer, provide it clearly and concisely.\n"
-                "- If the context does *not* contain the information to answer the question, you MUST explicitly state \"The provided context does not have the information to answer this question.\"\n"
-                "- Do NOT use any external knowledge or make assumptions beyond the provided context.\n"
-                "- If the user asks a general knowledge question that is not answerable from the context (e.g., 'What are the top 5 math papers?'), and no relevant context is provided, state that you cannot answer this without specific context or access to a real-time database."
-            )
-
-        final_llm_prompt = f"""{prompt_introduction}
-
-Context:
-{context_for_llm}
-
-User Question: {actual_user_question}
-
-Assistant Answer:"""
+            general_knowledge_prompt = f"{role_and_task} {negative_constraints}\n\nUSER'S QUESTION:\n{actual_user_question}\n\nASSISTANT'S FACTUAL ANSWER:"
         
-        logger.debug(f"Final prompt for local LLM (GGUF) (first 500 chars):\n{final_llm_prompt[:500]}...")
-
-        output_stream = local_llm(
-            final_llm_prompt,
-            max_tokens=AppConfig.LLAMA_MAX_TOKENS if hasattr(AppConfig, 'LLAMA_MAX_TOKENS') else 512, 
-            stop=["User Question:", "User:", "\n\n", "<|im_end|>"], 
-            temperature=AppConfig.LLAMA_TEMPERATURE if hasattr(AppConfig, 'LLAMA_TEMPERATURE') else 0.3, 
-            top_p=AppConfig.LLAMA_TOP_P if hasattr(AppConfig, 'LLAMA_TOP_P') else 0.9,
-            echo=False,
-            stream=True
-        )
+        logger.debug(f"Local general knowledge prompt (Direct Instruction Path v2) (first 300 chars): {general_knowledge_prompt[:300]}...")
         
-        full_response_for_log = []
-        for output_chunk in output_stream:
-            if 'choices' in output_chunk and len(output_chunk['choices']) > 0:
-                chunk_text = output_chunk['choices'][0].get('text', '')
-                if chunk_text:
-                    full_response_for_log.append(chunk_text)
-                    yield chunk_text
-        
-        logger.info(f"Generated local RAG response (streamed, hybrid approach if used): '{''.join(full_response_for_log)[:100]}...'")
+        generation_params_general = {
+            'max_tokens': AppConfig.LLAMA_MAX_TOKENS if hasattr(AppConfig, 'LLAMA_MAX_TOKENS') else 1024, 
+            'temperature': 0.3,  
+            'top_p': 0.7,    
+            'top_k': 20,     
+            'repeat_penalty': 1.2, 
+            'mirostat_mode': 0, 
+            'mirostat_tau': 5.0, 
+            'mirostat_eta': 0.1, 
+            'stop': [
+                "<|im_end|>", "\\nUser:", "\\nHuman:", "Human:", "Assistant:",
+                "\\nQuestion:", "\\nQuery:", "Factual Answer:", "ASSISTANT'S FACTUAL ANSWER:", "USER'S QUESTION:",
+                "Let's expand on this response", "Let's add some additional context",
+                "Let's add a question", "Here are some additional details",
+                "Here's an expansion", "To elaborate further",
+                "Answer:", "Context:", 
+                "In this response, I have provided", "In this response I have provided",
+                "This response provides an overview",
+                "Please also avoid overly technical or jargon-heavy language where appropriate.",
+                "This text follows standard conventions for informative responses.",
+                "All response fragments are well-structured adn completed successfully.",
+                "All response fragments are well-structured and completed successfully.",
+                "Any future contributions might include",
+                "This approach shows a common area to apply improvements",
+                "---N\nUser Query:"
+            ], 
+            'stream': True,
+            'echo': False
+        }
 
-    except Exception as e:
-        logger.error(f"Error during RAG generation with local model (hybrid approach): {e}", exc_info=True)
-        yield "Sorry, I encountered an error generating a response with the local model and RAG."
-        return
+        try:
+            logger.info("Invoking local LLM for general knowledge response...")
+            output_stream = local_llm(general_knowledge_prompt, **generation_params_general)
+            for chunk in output_stream:
+                if cancel_event.is_set(): 
+                    logger.info(f"General knowledge generation cancelled for chat_id {chat_id}.")
+                    yield CANCEL_MESSAGE
+                    return
+                text_chunk = chunk['choices'][0].get('text', '')
+                if text_chunk: 
+                    gemma_output_chunks.append(text_chunk)
+                    yield text_chunk
+            
+            if not gemma_output_chunks or not "".join(gemma_output_chunks).strip():
+                logger.warning("Local model general knowledge response was empty after streaming.")
+                yield "Sorry, I could not generate a response using the local model's general knowledge at this time."
+                return
+            logger.info("Local model general knowledge response successfully generated and streamed.")
+
+        except Exception as e_llm_call:
+            logger.error(f"Exception during local LLM call (general knowledge path): {e_llm_call}", exc_info=True)
+            yield "Sorry, an error occurred while the local model was generating a response."
+            return
+
+        final_response_for_log = "".join(gemma_output_chunks)
+        logger.info(f"Completed generate_local_rag_response (GK Path). Full response length: {len(final_response_for_log)}. Start: '{final_response_for_log[:100]}...'")
+
+    except Exception as e_outer_wrapper:
+        logger.error(f"Outer exception in generate_local_rag_response (GK Path): {e_outer_wrapper}", exc_info=True)
+        yield "Sorry, an unexpected server error occurred while preparing to generate a response with the local model."
+    # --- END OF REPLACEMENT ---
 
 # --- Flask Routes ---
 @app.route('/')
@@ -689,6 +680,10 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
     MAX_HISTORY_MESSAGES = 10 # Number of recent messages to include in context
     # ---
 
+    # Create a cancellation event for this request
+    current_cancel_event = threading.Event()
+    # Ensure chat_id is determined before this line if it can be new
+
     conn = get_db_connection()
     if not conn:
         # This scenario should ideally be handled more gracefully, 
@@ -719,6 +714,10 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
         conn.commit()
         logger.info(f"Stored user message for chat_id {chat_id}: '{user_message_content[:50]}...'")
 
+        # Register cancellation event for this chat_id *after* chat_id is confirmed/created
+        active_cancellation_events[chat_id] = current_cancel_event
+        logger.info(f"Registered cancellation event for chat_id {chat_id}")
+
         # --- Retrieve and Format Chat History ---
         full_prompt_for_model = f"User: {user_message_content}" # Default to current message if no history
         
@@ -726,12 +725,16 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
             prompt_history_parts = []
             # Fetch messages prior to the one just inserted for context
             # We order by timestamp ASC to build the history chronologically
+            query = (
+                "SELECT sender, content FROM messages "
+                "WHERE chat_id = ? AND timestamp < ("
+                "SELECT MAX(timestamp) FROM messages "
+                "WHERE chat_id = ? AND sender = 'user'"
+                ") ORDER BY timestamp ASC LIMIT ?"
+            )
             history_cursor_for_prompt = conn.execute(
-                """SELECT sender, content FROM messages 
-                   WHERE chat_id = ? AND timestamp < (SELECT MAX(timestamp) FROM messages WHERE chat_id = ? AND sender = 'user')
-                   ORDER BY timestamp ASC 
-                   LIMIT ?""", 
-                (chat_id, chat_id, MAX_HISTORY_MESSAGES) 
+                query,
+                (chat_id, chat_id, MAX_HISTORY_MESSAGES)
             )
             fetched_history = history_cursor_for_prompt.fetchall()
 
@@ -755,10 +758,12 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
             response_generator = generate_gemini_response(full_prompt_for_model, chat_id)
         else:
             logger.warning(f"Invalid model choice '{model_choice}' for chat_id {chat_id}")
+            active_cancellation_events.pop(chat_id, None) # Clean up event if returning early
             return jsonify({"error": "Invalid model choice"}), 400 # Return early
 
         if response_generator is None:
             logger.error(f"Response generator was None for model {model_choice}, chat_id {chat_id}")
+            active_cancellation_events.pop(chat_id, None) # Clean up event
             return jsonify({"error": "Failed to get response from model"}), 500 # Return early
         
         full_bot_response_parts = []
@@ -784,6 +789,13 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
             finally:
                 logger.info(f"Stream to client finished for chat_id {chat_id}. Attempting to save full bot response to DB.")
                 bot_response_content = "".join(full_bot_response_parts).strip()
+                
+                # Clean up cancellation event for this chat_id
+                removed_event = active_cancellation_events.pop(chat_id, None)
+                if removed_event:
+                    logger.info(f"Cleaned up cancellation event for chat_id {chat_id}.")
+                else:
+                    logger.warning(f"No cancellation event found to clean up for chat_id {chat_id} during stream_and_collect finally block.")
                 
                 if bot_response_content: # Only save if there's content
                     try:
@@ -817,14 +829,30 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
 
     except sqlite3.Error as e_sqlite:
         logger.error(f"Database error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e_sqlite}", exc_info=True)
+        if 'chat_id' in locals() and chat_id is not None: # Ensure chat_id is defined
+            active_cancellation_events.pop(chat_id, None) # Clean up on error
         return jsonify({"error": "Database operation failed"}), 500
     except Exception as e_main:
         logger.error(f"Unexpected error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e_main}", exc_info=True)
+        if 'chat_id' in locals() and chat_id is not None: # Ensure chat_id is defined
+            active_cancellation_events.pop(chat_id, None) # Clean up on error
         return jsonify({"error": "An unexpected server error occurred."}), 500
     finally:
         if conn: # This is the main connection for the request handling part
             conn.close()
             logger.debug(f"Closed main DB connection for /api/chat request (chat_id: {chat_id if 'chat_id' in locals() else 'unknown'}).")
+
+@app.route('/api/cancel_stream/<int:chat_id>', methods=['POST'])
+def cancel_stream(chat_id):
+    logger.info(f"Received cancellation request for chat_id: {chat_id}")
+    event = active_cancellation_events.get(chat_id)
+    if event:
+        event.set() # Signal the event
+        logger.info(f"Cancellation event set for chat_id: {chat_id}")
+        return jsonify({"message": f"Cancellation signal sent for chat_id {chat_id}."}), 200
+    else:
+        logger.warning(f"No active stream found to cancel for chat_id: {chat_id}")
+        return jsonify({"message": f"No active stream found for chat_id {chat_id} to cancel."}), 404
 
 @app.route('/api/folders/<int:folder_id>', methods=['DELETE'])
 def delete_folder(folder_id):
@@ -873,6 +901,6 @@ def delete_chat(chat_id):
 
 if __name__ == '__main__':
     # Initialize systems when running the script directly
-    init_db() # Initialize the database schema
-    initialize_systems() # Ensure systems are initialized
+    init_db()  # Initialize the database schema
+    initialize_systems()  # Ensure systems are initialized
     app.run(debug=AppConfig.FLASK_DEBUG, host=AppConfig.FLASK_HOST, port=AppConfig.FLASK_PORT) 
