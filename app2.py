@@ -333,13 +333,14 @@ def get_gemini_paper_suggestions(user_query_for_gemini: str) -> list[dict[str, s
         return []
 
     gemini_prompt = (
-        f"Based on current general knowledge, please list up to 5-7 highly relevant paper titles "
+        f"Based on current general knowledge, please list up to 5-7 distinct and highly relevant academic paper titles "
         f"for the query: '{user_query_for_gemini}'. "
+        f"Prioritize papers that are citable or foundational. "
         f"If readily available and confident, include their arXiv IDs in the format 'Title (arXiv:xxxx.xxxxx)'. "
         f"If no arXiv ID is known, just provide the title. "
-        f"Provide each paper on a new line. If no specific papers can be suggested, respond with 'NO_SUGGESTIONS_FOUND'."
+        f"Provide each paper on a new line. If you cannot suggest at least 3-4 high-quality, distinct papers, respond with 'NO_SUGGESTIONS_FOUND'."
     )
-    logger.info(f"Sending prompt to Gemini for paper suggestions: '{gemini_prompt[:150]}...'")
+    logger.info(f"Sending prompt to Gemini for paper suggestions: '{gemini_prompt[:200]}...")
 
     try:
         response_chunks = list(generate_gemini_response(gemini_prompt))
@@ -362,10 +363,21 @@ def get_gemini_paper_suggestions(user_query_for_gemini: str) -> list[dict[str, s
             if match:
                 title = match.group(1).strip()
                 arxiv_id = match.group(2).strip() if match.group(2) else None
+                
+                # Clean title: remove leading/trailing quotes and common unwanted prefixes like '* '
+                if title.startswith('*'):
+                    title = title[1:].lstrip()
+                title = title.strip('"\'') # Remove leading/trailing single or double quotes
+                
                 if title:
                     suggested_papers_info.append({"title": title, "arxiv_id": arxiv_id})
-            elif line: 
-                suggested_papers_info.append({"title": line, "arxiv_id": None})
+            elif line: # If no regex match but line has content, assume it's a title
+                title = line.strip('"\'')
+                if title.startswith('*'):
+                    title = title[1:].lstrip()
+                title = title.strip('"\'')
+                if title:
+                    suggested_papers_info.append({"title": title, "arxiv_id": None})
 
         logger.info(f"Parsed {len(suggested_papers_info)} paper suggestions from Gemini: {suggested_papers_info}")
         return suggested_papers_info
@@ -415,7 +427,7 @@ def are_texts_semantically_similar(text1: str, text2: str, threshold: float = 0.
 # UNCOMMENTED generate_local_rag_response
 def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     DEBUG_SKIP_AUGMENTATION = False 
-    DEBUG_SKIP_RAG_CONTEXT = True    # << KEEP RAG SKIPPED to avoid empty responses for now
+    DEBUG_SKIP_RAG_CONTEXT = False    # << CORRECTED THIS FLAG
     DEBUG_SKIP_GEMINI_SUGGESTIONS = False # << ENSURE GEMINI SUGGESTIONS ARE ON
 
     if not systems_status["local_llm_loaded"] or local_llm is None:
@@ -648,48 +660,68 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     if is_paper_query:
         if processed_titles_for_llm_instruction and not DEBUG_SKIP_GEMINI_SUGGESTIONS: # Gemini provided titles
             paper_specific_instruction = (
-                f"You are an AI research assistant. Your task is to process a list of provided paper titles. "
-                f"For each paper title, you must determine if relevant information is available in the 'CONTEXT FOR PROVIDED PAPER TITLES' section (which will appear later in this prompt). "
-                f"If information is found, use it for the abstract. If not, generate a plausible abstract using your own knowledge and reasoning.\\n\\n"
-                f"PAPER TITLES TO PROCESS:\\n{processed_titles_for_llm_instruction}\\n\\n"
-                f"INSTRUCTIONS FOR EACH PAPER TITLE:\\n"
-                f"1. Carefully read the paper title from the 'PAPER TITLES TO PROCESS' list.\\n"
-                f"2. Refer to the 'CONTEXT FOR PROVIDED PAPER TITLES' section in the full prompt. This section details findings from a local database search for each suggested title.\\n"
-                f"3. If the context for the current paper title indicates a 'Local Database Match' and provides a 'Retrieved Snippet':\\n"
-                f"   - Use this snippet as the abstract.\\n"
-                f"   - Format your response for this paper as:\\n"
-                f"     [Number]. Title: [Full Paper Title as provided in 'PAPER TITLES TO PROCESS']\\n"
-                f"        Abstract (from local database): [The retrieved snippet from context]\\n"
-                f"4. If the context indicates 'No specific abstract/document found' for the current paper title, or if the context is missing for this title:\\n"
-                f"   - Generate a concise, plausible-sounding abstract (1-3 sentences) for the paper based *only* on its title and your general knowledge. Employ a brief chain-of-thought for this generation.\\n"
-                f"   - Format your response for this paper as:\\n"
-                f"     [Number]. Title: [Full Paper Title as provided in 'PAPER TITLES TO PROCESS']\\n"
-                f"        Abstract (generated): [Your generated abstract]\\n"
-                f"        Reasoning (for generated abstract): [Briefly explain your thought process, e.g., 'Based on keywords X and Y, this paper likely discusses Z...'. If obvious, state 'Generated based on title analysis.']\\n"
-                f"5. If you absolutely cannot generate a meaningful abstract even from the title (after trying step 4), output:\\n"
-                f"     [Number]. Title: [Full Paper Title as provided in 'PAPER TITLES TO PROCESS']\\n"
-                f"        Abstract: Unable to provide an abstract for this title.\\n\\n"
-                f"OVERALL RESPONSE RULES:\\n"
-                f"- Your entire response MUST begin *exactly* with '1. Title: ' for the first paper and follow the numbering.\\n"
-                f"- ONLY include the numbered list of titles with their abstracts and reasoning as specified. No conversational fluff, intros, or outros.\\n"
-                f"- Ensure each paper's entry is distinct and follows the numbering from 'PAPER TITLES TO PROCESS'."
+                f"You are an AI research assistant. Your task is to process a list of paper titles provided under 'PAPER TITLES TO PROCESS'. "
+                f"For EACH paper title in that list, you MUST provide a relevant abstract. Follow these steps meticulously for each title:\n\n"
+                
+                f"PAPER TITLES TO PROCESS (one title per line; includes arXiv ID if available from initial suggestion):\n{processed_titles_for_llm_instruction}\n\n"
+                
+                f"INSTRUCTIONS FOR PROCESSING EACH PAPER TITLE FROM THE LIST ABOVE:\n"
+                f"1. Take the current paper title (and its arXiv ID, if present) from the 'PAPER TITLES TO PROCESS' list.\n"
+                f"2. Search the 'ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):' section (if present later in this prompt) for this exact title or a highly similar one. \n"
+                f"3. If a STRONG match is found in the DOCUMENT DATABASE context AND it provides relevant content/abstract:\n"
+                f"   - Use the retrieved content as the abstract for this paper. The abstract should be unique to this paper. Do NOT use placeholder text.\n"
+                f"   - Your output for this paper MUST be formatted STRICTLY as (example):\n"
+                f"     1. Title: [Exact Paper Title from 'PAPER TITLES TO PROCESS' (including arXiv ID if it was there)]\n"
+                f"        Abstract (from local database): [The relevant retrieved abstract/content snippet from the DOCUMENT DATABASE]\n"
+                f"4. If NO strong match is found in the DOCUMENT DATABASE context, OR if a match is found but it has no usable abstract:\n"
+                f"   - You MUST generate a concise, plausible, and UNIQUE abstract (1-3 sentences) for the paper based SOLELY on its title and your general knowledge. Do NOT use placeholder text. Do NOT repeat abstracts from other papers.\n"
+                f"   - Your output for this paper MUST be formatted STRICTLY as (example):\n"
+                f"     2. Title: [Exact Paper Title from 'PAPER TITLES TO PROCESS' (including arXiv ID if it was there)]\n"
+                f"        Abstract (generated): [Your UNIQUE generated abstract based on the title]\n"
+                f"5. If, after attempting step 4, you absolutely CANNOT generate a meaningful abstract even from the title:\n"
+                f"   - Your output for this paper MUST be formatted STRICTLY as (example):\n"
+                f"     3. Title: [Exact Paper Title from 'PAPER TITLES TO PROCESS' (including arXiv ID if it was there)]\n"
+                f"        Abstract: Unable to provide an abstract for this title.\n\n"
+                
+                f"CRITICAL OVERALL OUTPUT FORMATTING RULES (Adhere strictly):\n"
+                f"- Your entire response MUST begin *EXACTLY* with '1. Title: ' for the first paper processed, and continue numbering sequentially for ALL subsequent papers from the 'PAPER TITLES TO PROCESS' list.\n"
+                f"- Process EVERY title from the 'PAPER TITLES TO PROCESS' list.\n"
+                f"- NO conversational text, preamble, introduction, or conclusion. ONLY the numbered list of titles with their abstracts.\n"
+                f"- Each paper's 'X. Title: ...' line MUST be on its own line.\n"
+                f"- Each paper's 'Abstract: ...' line MUST start on the immediate next line, indented with exactly three spaces.\n"
+                f"- Do NOT use any markdown list characters like '*', '-', or similar at the start of any line related to the paper list.\n"
+                f"- Ensure the paper titles (and arXiv IDs, if present) in your output EXACTLY match those from the 'PAPER TITLES TO PROCESS' list.\n"
+                f"- DO NOT include a 'Reasoning' section. Only Title and Abstract."
             )
         else: # Paper query, but no Gemini suggestions (or they are skipped), so LLM suggests its own
             paper_specific_instruction = (
                 f"You are an AI research assistant. The user is asking for paper suggestions. "
                 f"Your task is to suggest up to 3-5 relevant academic paper titles based on the user's query and your general knowledge. "
                 f"For each paper you suggest, provide its title and then generate a brief, plausible-sounding abstract (1-2 sentences).\\n\\n"
-                # Add a note about checking local RAG context if it exists for its own suggestions
+                
                 f"If general 'Retrieved Document' context is available in this prompt, you can check if any of your suggested titles coincidentally match any retrieved document titles. If so, you may use that content for the abstract, noting it as '(potentially related to retrieved context)'. Otherwise, generate the abstract from your knowledge.\\n\\n"
-                f"OUTPUT FORMATTING RULES FOR EACH SUGGESTED PAPER:\\n"
-                f"1. Start with the paper number, then 'Title: ', followed by the paper title you are suggesting. (e.g., '1. Title: [Suggested Paper Title]')\\n"
-                f"2. On the *next line*, indented with three spaces, write 'Abstract: ' followed by the concise (1-2 sentences) abstract. If using RAG context, you can note it.\\n"
-                f"3. If you cannot confidently generate a meaningful abstract for a title you suggest, write 'Abstract: General suggestion based on topic; specific abstract not available.'\\n\\n"
-                f"OVERALL RESPONSE RULES:\\n"
-                f"- Your entire response MUST begin *exactly* with '1. Title: ' for the first paper you suggest.\\n"
-                f"- Your response MUST ONLY contain the numbered list of your suggested titles with their corresponding abstracts. Nothing else before or after.\\n"
-                f"- If you cannot find any relevant papers to suggest from your knowledge, respond ONLY with the phrase: 'I am unable to suggest specific papers from my current knowledge based on your query.'\\n"
-                f"- Do NOT include conversational introductions, closings, meta-commentary, or self-references (unless stating inability to suggest papers as above)."
+
+                f"CRITICAL OUTPUT FORMATTING RULES (Adhere strictly to ensure proper display):\\n"
+                f"1. Your response MUST begin *EXACTLY* with '1. Title: ' (for the first paper) and contain NO text or preamble before it.\\n"
+                f"2. For EACH paper you suggest:\\n"
+                f"   a. Start the line with the paper number, a period, a single space, and then 'Title: ' followed by the paper title. (e.g., '1. Title: Example Paper Title')\\n"
+                f"   b. The paper title itself should NOT contain any literal '\\\\n' characters. If a title is long, let it wrap naturally.\\n"
+                f"   c. On the VERY NEXT LINE (achieved by outputting a single newline character after the title line), indent with EXACTLY three spaces, then write 'Abstract: ' followed by the concise (1-2 sentences) abstract.\\n"
+                f"   d. The abstract itself should NOT contain any literal '\\\\n' characters within a sentence. If the abstract is long, let it wrap naturally. Use a single newline character ONLY to end the abstract line.\\n"
+                f"   e. After the abstract line for one paper, the next paper's 'X. Title:' line MUST start immediately on the next line. Do NOT insert blank lines between papers.\\n"
+                f"   f. Do NOT use any markdown list markers like '*', '-', or similar characters at the start of any line related to the paper list.\\n\\n"
+                
+                f"EXAMPLE OF CORRECT FORMAT FOR TWO PAPERS (this is how your output should look):\\n"
+                f"1. Title: Deep Learning for Molecules and Materials\\n"
+                f"   Abstract: This paper reviews the application of deep learning in chemistry and materials science, covering areas like property prediction and generative models.\\n"
+                f"2. Title: The Role of Catalysis in Green Chemistry\\n"
+                f"   Abstract: Explores various catalytic methods that contribute to environmentally friendly chemical processes, reducing waste and energy consumption.\\n\\n"
+
+                f"FURTHER OVERALL RESPONSE RULES:\\n"
+                f"- Your response MUST ONLY contain the numbered list of your suggested titles and their abstracts, following the CRITICAL OUTPUT FORMATTING RULES. Nothing else before or after this list.\\n"
+                f"- If you cannot confidently generate a meaningful abstract for a title you suggest, use 'Abstract: General suggestion based on topic; specific abstract not available.' for that paper's abstract line.\\n"
+                f"- If you cannot find any relevant papers to suggest from your knowledge, respond ONLY with the exact phrase: 'I am unable to suggest specific papers from my current knowledge based on your query.' (This exact phrase, and nothing else).\\n"
+                f"- Do NOT include conversational introductions, closings (like 'I hope this helps!'), meta-commentary, or self-references (unless using the specific inability phrase above)."
             )
     
     # Determine which instruction to use
