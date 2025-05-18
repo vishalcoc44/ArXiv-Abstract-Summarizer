@@ -13,8 +13,12 @@ import sqlite3
 import datetime
 import colorama
 import json # Add this import at the top of the file if not already there
+import re # For parsing Gemini response
+import atexit # For controlled cleanup
 
-colorama.init()
+# Initialize colorama carefully for Windows
+# colorama.init() # Original
+colorama.init(wrap=False) # Try with wrap=False to see if it resolves OSError 6
 
 # Load environment variables
 load_dotenv()
@@ -35,9 +39,12 @@ class AppConfig:
     # RAG Configuration
     EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
     N_RETRIEVED_DOCS = 3
+    LLAMA_MAX_TOKENS = 1024 # Example, adjust as needed
+    LLAMA_TEMPERATURE = 0.3
+    LLAMA_TOP_P = 0.9
     
     # Llama.cpp model parameters
-    LLAMA_N_CTX = 2048
+    LLAMA_N_CTX = 4096
     LLAMA_N_GPU_LAYERS = 0 
     LLAMA_VERBOSE = False
 
@@ -72,6 +79,38 @@ local_llm = None
 faiss_index = None
 embeddings_model = None
 # gemini_model = None # This was for the SDK
+
+# --- Cleanup function for Llama model ---
+def cleanup_local_llm():
+    global local_llm
+    if local_llm is not None:
+        logger.info("Cleaning up local Llama model...")
+        try:
+            # Accessing internal _model and _ctx might be needed if no public close() method exists
+            # However, llama-cpp-python's Llama object should handle this in its __del__ or a close method.
+            # For now, let's assume __del__ should work if the object is valid.
+            # Setting to None will help trigger garbage collection if it hasn't happened.
+            # A more explicit model.close() or model.free() would be better if available.
+            # The Llama object itself has a context manager, so if it were used like:
+            # with Llama(...) as llm: # it would auto-cleanup.
+            # Since it's global, we do this.
+            if hasattr(local_llm, 'close'): # Check if a close method exists (newer versions might)
+                local_llm.close()
+            elif hasattr(local_llm, '_model') and local_llm._model is not None: # Attempt more direct cleanup if no close()
+                 logger.info("Attempting to free model via internal attributes as no close() method found.")
+                 # This is risky and depends on llama-cpp-python internals if they haven't exposed a clean .close()
+                 # Forcing __del__ by removing reference
+                 del local_llm
+                 local_llm = None
+            else:
+                 del local_llm # Fallback to hoping __del__ handles it
+                 local_llm = None
+            logger.info("Local Llama model cleanup attempt finished.")
+        except Exception as e:
+            logger.error(f"Error during local_llm cleanup: {e}", exc_info=True)
+
+# Register the cleanup function to be called at exit
+atexit.register(cleanup_local_llm)
 
 # --- System Initialization Status Flags ---
 systems_status = {
@@ -267,8 +306,58 @@ def generate_gemini_response(prompt, chat_id=None):
         logger.error(f"Error processing Gemini response: {e}", exc_info=True)
         yield "Sorry, I encountered an unexpected error trying to connect to the Gemini service."
 
+# --- Helper function to get paper suggestions from Gemini ---
+def get_gemini_paper_suggestions(user_query_for_gemini: str) -> list[dict[str, str | None]]:
+    if not systems_status["gemini_model_configured"] or not AppConfig.GEMINI_API_KEY:
+        logger.warning("Attempted to get paper suggestions, but Gemini API is not configured.")
+        return []
+
+    gemini_prompt = (
+        f"Based on current general knowledge, please list up to 5-7 highly relevant paper titles "
+        f"for the query: '{user_query_for_gemini}'. "
+        f"If readily available and confident, include their arXiv IDs in the format 'Title (arXiv:xxxx.xxxxx)'. "
+        f"If no arXiv ID is known, just provide the title. "
+        f"Provide each paper on a new line. If no specific papers can be suggested, respond with 'NO_SUGGESTIONS_FOUND'."
+    )
+    logger.info(f"Sending prompt to Gemini for paper suggestions: '{gemini_prompt[:150]}...'")
+
+    try:
+        response_chunks = list(generate_gemini_response(gemini_prompt))
+        full_gemini_text_response = "".join(response_chunks).strip()
+        logger.debug(f"Full raw response from Gemini for suggestions: {full_gemini_text_response}")
+
+        if "NO_SUGGESTIONS_FOUND" in full_gemini_text_response or not full_gemini_text_response:
+            logger.info("Gemini indicated no suggestions found or returned an empty response.")
+            return []
+
+        suggested_papers_info = []
+        paper_pattern = re.compile(r"^(.*?)(?:\s*\(arXiv:([\d\.]+)\))?$", re.MULTILINE)
+        
+        for line in full_gemini_text_response.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            match = paper_pattern.match(line)
+            if match:
+                title = match.group(1).strip()
+                arxiv_id = match.group(2).strip() if match.group(2) else None
+                if title:
+                    suggested_papers_info.append({"title": title, "arxiv_id": arxiv_id})
+            elif line: 
+                suggested_papers_info.append({"title": line, "arxiv_id": None})
+
+        logger.info(f"Parsed {len(suggested_papers_info)} paper suggestions from Gemini: {suggested_papers_info}")
+        return suggested_papers_info
+
+    except Exception as e:
+        logger.error(f"Error calling or parsing Gemini for paper suggestions: {e}", exc_info=True)
+        return []
+
+# --- End Helper --- 
+
 # UNCOMMENTED generate_local_rag_response
-def generate_local_rag_response(user_query, chat_id=None):
+def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     if not systems_status["local_llm_loaded"]:
         logger.warning("Attempted to use local model for RAG, but it's not loaded.")
         yield "Local model is not loaded. Cannot generate RAG response."
@@ -279,51 +368,123 @@ def generate_local_rag_response(user_query, chat_id=None):
         return
 
     try:
-        logger.info(f"Searching FAISS index for: '{user_query}'")
-        retrieved_docs = faiss_index.similarity_search(user_query, k=AppConfig.N_RETRIEVED_DOCS)
+        actual_user_question = user_query_with_history
+        if isinstance(user_query_with_history, str) and "\nUser: " in user_query_with_history:
+            parts = user_query_with_history.split("\nUser: ")
+            if parts:
+                actual_user_question = parts[-1]
+        logger.info(f"Processing RAG for actual user question: '{actual_user_question[:100]}...'")
+
+        is_paper_suggestion_query = False
+        keywords_for_paper_suggestion = [
+            "top papers", "list papers", "recommend papers", "find papers on", 
+            "literature on", "key papers in", "recent papers in", "suggest papers",
+            "summarize papers on", "what papers discuss"
+        ]
+        if any(keyword in actual_user_question.lower() for keyword in keywords_for_paper_suggestion):
+            is_paper_suggestion_query = True
+            logger.info(f"Query identified as potentially needing external paper suggestions: '{actual_user_question}'")
+
+        gemini_suggested_papers = [] 
+        if is_paper_suggestion_query:
+            gemini_suggested_papers = get_gemini_paper_suggestions(actual_user_question)
         
-        context_for_llm = "No relevant context found."
-        if not retrieved_docs:
-            logger.info("No relevant documents found for RAG context.")
+        final_context_docs = []
+        verified_gemini_papers_metadata = []
+
+        if gemini_suggested_papers:
+            logger.info(f"Checking local FAISS for {len(gemini_suggested_papers)} suggestions from Gemini...")
+            for paper_info in gemini_suggested_papers:
+                query_text = paper_info['title']
+                retrieved_docs_for_title = faiss_index.similarity_search_with_score(query_text, k=1)
+                
+                if retrieved_docs_for_title:
+                    doc, score = retrieved_docs_for_title[0]
+                    SIMILARITY_THRESHOLD_L2 = 1.0 
+                    if score <= SIMILARITY_THRESHOLD_L2:
+                        logger.info(f"Found potential local match for Gemini suggestion '{paper_info['title']}' with score {score:.4f}. Adding to context.")
+                        final_context_docs.append(doc) 
+                        if doc.metadata: # Ensure metadata exists
+                           verified_gemini_papers_metadata.append(doc.metadata)
+                        if len(final_context_docs) >= AppConfig.N_RETRIEVED_DOCS * 2:
+                            break 
+                    else:
+                        logger.info(f"Local match for '{paper_info['title']}' found but score {score:.4f} too low (threshold {SIMILARITY_THRESHOLD_L2}).")
+            
+            if final_context_docs:
+                logger.info(f"Found {len(final_context_docs)} documents in local FAISS corresponding to Gemini's suggestions.")
+            else:
+                logger.info("None of Gemini's suggestions were found with high confidence in local FAISS.")
+
+        if not is_paper_suggestion_query or not final_context_docs:
+            if not final_context_docs: 
+                logger.info(f"Performing general FAISS similarity search with query: '{actual_user_question[:100]}...'")
+                retrieved_docs_general = faiss_index.similarity_search(actual_user_question, k=AppConfig.N_RETRIEVED_DOCS)
+                if retrieved_docs_general:
+                    final_context_docs.extend(retrieved_docs_general)
+
+        context_for_llm = "No relevant context found in the local knowledge base for your query."
+        if final_context_docs:
+            unique_docs_by_content = {}
+            for doc in final_context_docs:
+                if doc.page_content not in unique_docs_by_content:
+                    unique_docs_by_content[doc.page_content] = doc
+            final_context_docs = list(unique_docs_by_content.values())            
+            context_for_llm = "\n\n---\n\n".join([doc.page_content for doc in final_context_docs])
+
+        prompt_introduction = ""
+        if verified_gemini_papers_metadata:
+            titles_found_locally = [meta.get('title', '[Unknown Title]') for meta in verified_gemini_papers_metadata if meta]
+            if titles_found_locally:
+                prompt_introduction = (
+                    f"An external knowledge source suggested the following papers related to your query: '{actual_user_question}'. "
+                    f"I have found information for these in my local knowledge base: \n- " + "\n- ".join(titles_found_locally) +
+                    f"\n\nPlease use the context below, which contains details for these locally found papers, to answer the user's question."
+                )
+            else:
+                prompt_introduction = "I consulted an external knowledge source, but couldn't verify its suggestions in my local data. Using general local knowledge instead:"
         else:
-            context_for_llm = "\n".join([doc.page_content for doc in retrieved_docs])
-            logger.info(f"Retrieved {len(retrieved_docs)} documents for RAG context.")
-        
-        prompt = f"""Based on the following context, please provide a comprehensive answer to the user's question. If the context does not contain the answer, state that the context is insufficient or you don't know based on the provided information.
+            prompt_introduction = (
+                "You are a factual assistant. Your primary goal is to answer the user's question based *only* on the provided \"Context\" below.\n"
+                "- If the context contains the answer, provide it clearly and concisely.\n"
+                "- If the context does *not* contain the information to answer the question, you MUST explicitly state \"The provided context does not have the information to answer this question.\"\n"
+                "- Do NOT use any external knowledge or make assumptions beyond the provided context.\n"
+                "- If the user asks a general knowledge question that is not answerable from the context (e.g., 'What are the top 5 math papers?'), and no relevant context is provided, state that you cannot answer this without specific context or access to a real-time database."
+            )
+
+        final_llm_prompt = f"""{prompt_introduction}
 
 Context:
 {context_for_llm}
 
-User Question: {user_query}
+User Question: {actual_user_question}
 
 Assistant Answer:"""
         
-        logger.debug(f"Prompt for local LLM (GGUF):\n{prompt}")
+        logger.debug(f"Final prompt for local LLM (GGUF) (first 500 chars):\n{final_llm_prompt[:500]}...")
 
         output_stream = local_llm(
-            prompt,
-            max_tokens=512, 
-            stop=["User Question:", "User:", "\n\n"],
+            final_llm_prompt,
+            max_tokens=AppConfig.LLAMA_MAX_TOKENS if hasattr(AppConfig, 'LLAMA_MAX_TOKENS') else 512, 
+            stop=["User Question:", "User:", "\n\n", "<|im_end|>"], 
+            temperature=AppConfig.LLAMA_TEMPERATURE if hasattr(AppConfig, 'LLAMA_TEMPERATURE') else 0.3, 
+            top_p=AppConfig.LLAMA_TOP_P if hasattr(AppConfig, 'LLAMA_TOP_P') else 0.9,
             echo=False,
-            stream=True  # Enable streaming for llama-cpp-python
+            stream=True
         )
         
-        logger.info("Local LLM (GGUF) stream started...")
         full_response_for_log = []
         for output_chunk in output_stream:
-            # logging.debug(f"Local LLM chunk: {output_chunk}") # For debugging
             if 'choices' in output_chunk and len(output_chunk['choices']) > 0:
                 chunk_text = output_chunk['choices'][0].get('text', '')
                 if chunk_text:
-                    # logger.info(f"Yielding local LLM chunk: {chunk_text}")
                     full_response_for_log.append(chunk_text)
                     yield chunk_text
         
-        logger.info(f"Generated local RAG response (streamed): '{''.join(full_response_for_log)[:100]}...'")
-        # No single return value needed here as we are yielding
+        logger.info(f"Generated local RAG response (streamed, hybrid approach if used): '{''.join(full_response_for_log)[:100]}...'")
 
     except Exception as e:
-        logger.error(f"Error during RAG generation with local model: {e}", exc_info=True)
+        logger.error(f"Error during RAG generation with local model (hybrid approach): {e}", exc_info=True)
         yield "Sorry, I encountered an error generating a response with the local model and RAG."
         return
 
@@ -523,31 +684,32 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
 
     chat_id = data.get('chat_id')
     model_choice = data.get('model_type', 'gemma') # Default to gemma if not specified
+    
+    # --- Configuration for Context History ---
+    MAX_HISTORY_MESSAGES = 10 # Number of recent messages to include in context
+    # ---
 
     conn = get_db_connection()
     if not conn:
+        # This scenario should ideally be handled more gracefully, 
+        # perhaps with a retry or a clearer error message to the user.
+        logger.error("Database connection failed in chat_api at the beginning.")
         return jsonify({"error": "Database connection failed"}), 500
 
     try:
         if chat_id:
-            # Verify chat_id exists and belongs to user (simplified: just check existence)
             chat = conn.execute("SELECT id FROM chats WHERE id = ?", (chat_id,)).fetchone()
             if not chat:
-                # If chat_id is provided but not found, create a new one.
-                # This could be an alternative to erroring out, depending on desired UX.
-                # For now, let's assume we'd rather create a new chat if a bogus ID is passed.
-                # Or, more strictly, return an error:
-                # conn.close()
-                # return jsonify({"error": "Chat not found"}), 404
-                # Decided: for robustness, if an invalid chat_id comes, make a new chat.
-                chat_id = None 
+                logger.info(f"Invalid chat_id {chat_id} provided. Treating as a new chat.")
+                chat_id = None # If chat_id is invalid, treat as a new chat
                 
         if not chat_id:
-            # Create new chat
-            cursor = conn.execute("INSERT INTO chats (user_id, folder_id) VALUES (?, ?)", (1, None)) # Assuming user_id 1, no folder
+            # Create new chat. Consider making title more dynamic or based on first message later.
+            new_chat_title = f"Chat {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}" 
+            cursor = conn.execute("INSERT INTO chats (title) VALUES (?)", (new_chat_title,))
             conn.commit()
             chat_id = cursor.lastrowid
-            logger.info(f"Created new chat with ID: {chat_id}")
+            logger.info(f"Created new chat with ID: {chat_id}, Title: {new_chat_title}")
 
         # Store user message
         conn.execute(
@@ -555,40 +717,76 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
             (chat_id, 'user', user_message_content)
         )
         conn.commit()
-        logger.info(f"Stored user message for chat_id {chat_id}")
+        logger.info(f"Stored user message for chat_id {chat_id}: '{user_message_content[:50]}...'")
+
+        # --- Retrieve and Format Chat History ---
+        full_prompt_for_model = f"User: {user_message_content}" # Default to current message if no history
+        
+        if chat_id: 
+            prompt_history_parts = []
+            # Fetch messages prior to the one just inserted for context
+            # We order by timestamp ASC to build the history chronologically
+            history_cursor_for_prompt = conn.execute(
+                """SELECT sender, content FROM messages 
+                   WHERE chat_id = ? AND timestamp < (SELECT MAX(timestamp) FROM messages WHERE chat_id = ? AND sender = 'user')
+                   ORDER BY timestamp ASC 
+                   LIMIT ?""", 
+                (chat_id, chat_id, MAX_HISTORY_MESSAGES) 
+            )
+            fetched_history = history_cursor_for_prompt.fetchall()
+
+            if fetched_history:
+                for row in fetched_history:
+                    sender_tag = "User" if row['sender'] == 'user' else "Assistant"
+                    prompt_history_parts.append(f"{sender_tag}: {row['content']}")
+                
+                history_string = "\n".join(prompt_history_parts) # Use literal newline for LLM
+                full_prompt_for_model = f"{history_string}\nUser: {user_message_content}"
+            
+            logger.info(f"Constructed prompt for chat_id {chat_id} (history rows: {len(fetched_history)}). Prompt (first 100 chars): {full_prompt_for_model[:100]}...")
+        # --- End Retrieve and Format Chat History ---
 
         response_generator = None
         if model_choice == 'gemma':
-            logger.info(f"Using Gemma (local Llama) for chat_id {chat_id}")
-            response_generator = generate_local_rag_response(user_message_content, chat_id)
+            logger.info(f"Using Gemma (local Llama) for chat_id {chat_id} with prompt: '{full_prompt_for_model[:100]}...'")
+            response_generator = generate_local_rag_response(full_prompt_for_model, chat_id)
         elif model_choice == 'gemini':
-            logger.info(f"Using Gemini API for chat_id {chat_id}")
-            response_generator = generate_gemini_response(user_message_content, chat_id)
+            logger.info(f"Using Gemini API for chat_id {chat_id} with prompt: '{full_prompt_for_model[:100]}...'")
+            response_generator = generate_gemini_response(full_prompt_for_model, chat_id)
         else:
-            # conn.close() # Already in finally
-            return jsonify({"error": "Invalid model choice"}), 400
+            logger.warning(f"Invalid model choice '{model_choice}' for chat_id {chat_id}")
+            return jsonify({"error": "Invalid model choice"}), 400 # Return early
 
         if response_generator is None:
-            # This case should ideally be handled by the model functions returning an error yield
             logger.error(f"Response generator was None for model {model_choice}, chat_id {chat_id}")
-            # conn.close() # Already in finally
-            return jsonify({"error": "Failed to get response from model"}), 500
+            return jsonify({"error": "Failed to get response from model"}), 500 # Return early
         
         full_bot_response_parts = []
         def stream_and_collect():
             nonlocal full_bot_response_parts
-            db_conn_for_stream = None # Use a separate connection for this generator's scope
+            # This db_conn_for_stream is crucial because the main `conn` will be closed 
+            # by the time this generator's finally block might execute in some edge cases 
+            # or if the main request handling finishes before the stream does.
+            db_conn_for_stream = get_db_connection()
+            if not db_conn_for_stream:
+                logger.error(f"Failed to get DB connection for stream_and_collect (chat_id: {chat_id}). Bot response will not be saved.")
+                # Yield an error message or handle as appropriate
+                yield "Error: Could not save conversation history due to a database issue."
+                return
+
             try:
                 for chunk in response_generator:
                     full_bot_response_parts.append(chunk)
                     yield chunk 
+            except Exception as e_stream:
+                logger.error(f"Error during response streaming for chat_id {chat_id}: {e_stream}", exc_info=True)
+                yield "Error: An error occurred while streaming the response." # Let client know
             finally:
-                # This block executes after the generator is exhausted or closed.
-                logger.info(f"Stream to client finished for chat_id {chat_id}. Saving full bot response to DB.")
-                bot_response_content = "".join(full_bot_response_parts)
+                logger.info(f"Stream to client finished for chat_id {chat_id}. Attempting to save full bot response to DB.")
+                bot_response_content = "".join(full_bot_response_parts).strip()
+                
                 if bot_response_content: # Only save if there's content
                     try:
-                        db_conn_for_stream = get_db_connection()
                         # Store bot message
                         db_conn_for_stream.execute(
                             "INSERT INTO messages (chat_id, sender, content) VALUES (?, ?, ?)",
@@ -596,33 +794,35 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
                         )
                         
                         # Update chat's last_snippet and updated_at
-                        # Use user message for snippet, as per original logic.
-                        snippet = (user_message_content[:30] + "...") if len(user_message_content) > 30 else user_message_content
+                        # Using the last user message as snippet, or first part of it.
+                        snippet = (user_message_content[:70] + "...") if len(user_message_content) > 70 else user_message_content
                         db_conn_for_stream.execute(
                             "UPDATE chats SET last_snippet = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                             (snippet, chat_id)
                         )
                         db_conn_for_stream.commit()
-                        logger.info(f"Bot response and chat snippet for chat_id {chat_id} saved to DB.")
-                    except sqlite3.Error as e_db:
-                        logger.error(f"Database error while saving streamed bot response for chat_id {chat_id}: {e_db}", exc_info=True)
+                        logger.info(f"Bot response and chat snippet for chat_id {chat_id} saved to DB (snippet: '{snippet}').")
+                    except sqlite3.Error as e_db_stream:
+                        logger.error(f"Database error while saving streamed bot response for chat_id {chat_id}: {e_db_stream}", exc_info=True)
+                    except Exception as e_save_stream:
+                        logger.error(f"Unexpected error while saving streamed bot response for chat_id {chat_id}: {e_save_stream}", exc_info=True)
                     finally:
                         if db_conn_for_stream:
                             db_conn_for_stream.close()
+                            logger.debug(f"Closed DB connection for stream_and_collect (chat_id: {chat_id}).")
                 else:
-                    logger.info(f"No bot response content generated for chat_id {chat_id}, not saving to DB.")
+                    logger.info(f"No bot response content generated or collected for chat_id {chat_id}, not saving to DB.")
         
-        # Stream to client. The stream_and_collect generator will handle DB ops in its finally block.
         return Response(stream_and_collect(), mimetype='text/plain') 
 
-    except sqlite3.Error as e:
-        logger.error(f"Database error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e}", exc_info=True)
+    except sqlite3.Error as e_sqlite:
+        logger.error(f"Database error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e_sqlite}", exc_info=True)
         return jsonify({"error": "Database operation failed"}), 500
-    except Exception as e:
-        logger.error(f"Unexpected error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e}", exc_info=True)
+    except Exception as e_main:
+        logger.error(f"Unexpected error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e_main}", exc_info=True)
         return jsonify({"error": "An unexpected server error occurred."}), 500
     finally:
-        if conn:
+        if conn: # This is the main connection for the request handling part
             conn.close()
             logger.debug(f"Closed main DB connection for /api/chat request (chat_id: {chat_id if 'chat_id' in locals() else 'unknown'}).")
 

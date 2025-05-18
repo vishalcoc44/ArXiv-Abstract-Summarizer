@@ -17,6 +17,8 @@ arxiv_abstracts/
 Research Papers/
 fine_tuned_model_gemma_colab_3_1b/
 merged_gemma_1b_finetuned_hf/
+langchain_faiss_store_optimized/
+
 # Ignore large language model files
 *.gguf
 
