@@ -644,16 +644,9 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     retrieved_context_str_for_prompt = ""
     retrieved_docs_for_log = [] # <--- ADD THIS LINE EXACTLY HERE
 
-    # Build the contextual_info_for_llm_about_papers if Gemini suggestions exist
-    if is_paper_query and unique_gemini_paper_suggestions and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
-        contextual_info_for_llm_about_papers = f"CONTEXT FOR PROVIDED PAPER TITLES:\\n{processed_titles_for_llm_instruction}\\n\\n"
-        logger.info("Gemini suggestions exist and will be included in the context.")
-    else:
-        contextual_info_for_llm_about_papers = ""
-        logger.info("No Gemini suggestions exist or they are being skipped.")
-
-    # Build general RAG context if not a paper query with specific context, or if paper query but no gemini suggestions
-    if not (is_paper_query and contextual_info_for_llm_about_papers) and final_rag_documents_for_prompt:
+    # This string should *always* be built if final_rag_documents_for_prompt has content.
+    # It represents the best documents found, whether from targeted or general search.
+    if final_rag_documents_for_prompt:
         context_parts = []
         # Current logic limits to 1 RAG doc for debugging, let's use AppConfig.N_RETRIEVED_DOCS
         # for doc_to_add in final_rag_documents_for_prompt[:1]: # Original DEBUG limit
@@ -669,7 +662,17 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             retrieved_context_str_for_prompt = "\\n".join(context_parts)
             logger.info(f"General RAG context prepared with {len(retrieved_docs_for_log)} documents for LLM.")
         else:
-            logger.info("No general RAG documents will be added to the LLM prompt.")
+            logger.info("No general RAG documents will be added to the LLM prompt (context_parts empty).")
+    else:
+        logger.info("final_rag_documents_for_prompt is empty. No RAG context string will be built.")
+
+    # Build the contextual_info_for_llm_about_papers if Gemini suggestions exist
+    if is_paper_query and unique_gemini_paper_suggestions and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
+        contextual_info_for_llm_about_papers = f"CONTEXT FOR PROVIDED PAPER TITLES:\\n{processed_titles_for_llm_instruction}\\n\\n"
+        logger.info("Gemini suggestions exist and will be included in the context.")
+    else:
+        contextual_info_for_llm_about_papers = ""
+        logger.info("No Gemini suggestions exist or they are being skipped.")
 
     # --- Stop sequences ---
     # These are common phrases the model might try to output that we want to stop.
@@ -746,32 +749,32 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
         else: # Paper query, but no Gemini suggestions (or they are skipped), so LLM suggests its own
             paper_specific_instruction = (
                 f"You are an AI research assistant. The user is asking for paper suggestions. "
-                f"Your task is to suggest up to 3-5 relevant academic paper titles based on the user's query and your general knowledge. "
-                f"For each paper you suggest, provide its title and then generate a brief, plausible-sounding abstract (1-2 sentences).\\n\\n"
+                f"Your task is to suggest 3 to 5 relevant academic paper titles based on the user's query and your general knowledge. "
+                f"For EACH paper title you suggest, you MUST then provide a brief, plausible-sounding abstract (1-2 sentences) specifically for that title.\n\n"
                 
-                f"If general 'Retrieved Document' context is available in this prompt, you can check if any of your suggested titles coincidentally match any retrieved document titles. If so, you may use that content for the abstract, noting it as '(potentially related to retrieved context)'. Otherwise, generate the abstract from your knowledge.\\n\\n"
+                f"If general 'Retrieved Document' context is available later in this prompt, you can check if any of YOUR suggested titles coincidentally match any retrieved document titles. If a strong match exists AND the retrieved content is suitable as an abstract, you MAY use that content for the abstract, noting it by starting the abstract with '(From database): '. Otherwise, you MUST generate the abstract from your own knowledge based on the title you suggested.\n\n"
 
-                f"CRITICAL OUTPUT FORMATTING RULES (Adhere strictly to ensure proper display):\\n"
-                f"1. Your response MUST begin *EXACTLY* with '1. Title: ' (for the first paper) and contain NO text or preamble before it.\\n"
-                f"2. For EACH paper you suggest:\\n"
-                f"   a. Start the line with the paper number, a period, a single space, and then 'Title: ' followed by the paper title. (e.g., '1. Title: Example Paper Title')\\n"
-                f"   b. The paper title itself should NOT contain any literal '\\\\n' characters. If a title is long, let it wrap naturally.\\n"
-                f"   c. On the VERY NEXT LINE (achieved by outputting a single newline character after the title line), indent with EXACTLY three spaces, then write 'Abstract: ' followed by the concise (1-2 sentences) abstract.\\n"
-                f"   d. The abstract itself should NOT contain any literal '\\\\n' characters within a sentence. If the abstract is long, let it wrap naturally. Use a single newline character ONLY to end the abstract line.\\n"
-                f"   e. After the abstract line for one paper, the next paper's 'X. Title:' line MUST start immediately on the next line. Do NOT insert blank lines between papers.\\n"
-                f"   f. Do NOT use any markdown list markers like '*', '-', or similar characters at the start of any line related to the paper list.\\n\\n"
+                f"CRITICAL OUTPUT FORMATTING RULES (Adhere strictly to ensure proper display and parsing):\n"
+                f"1. Your entire response MUST begin *EXACTLY* with '1. Title: ' for the first paper you suggest. There must be NO text, preamble, or conversational phrases before this first '1. Title: ' line.\n"
+                f"2. For EACH paper you suggest (from 1 to 5 papers):\n"
+                f"   a. Start the line with the sequential paper number (e.g., 1, 2, 3), followed by a period, a single space, and then the phrase 'Title: ' followed by the paper title you are suggesting. (Example: '1. Title: Example Paper Title')\n"
+                f"   b. The paper title itself should NOT contain any literal '\\\\n' characters. If a title is long, let it wrap naturally.\n"
+                f"   c. On the VERY NEXT LINE (achieved by outputting a single newline character '\\n' immediately after the title line, and nothing else on that line), you MUST indent with EXACTLY three spaces, then write 'Abstract: ' followed by the concise (1-2 sentences) abstract for THIS SPECIFIC TITLE.\n"
+                f"   d. The abstract content itself MUST be an actual abstract. It should NOT be conversational, nor should it be a comment about the list of papers or the suggestion process. It should NOT contain any literal '\\\\n' characters within a sentence. If the abstract is long, let it wrap naturally. Use a single newline character '\\n' ONLY to end the abstract line.\n"
+                f"   e. After the abstract line for one paper, the next paper's 'X. Title:' line (if any) MUST start immediately on the next line. Do NOT insert any blank lines between suggested papers.\n"
+                f"   f. Do NOT use any markdown list markers (like '* ', '- ', '+ ') or any other characters at the start of the 'X. Title:' or '   Abstract:' lines other than what is explicitly specified.\n\n"
                 
-                f"EXAMPLE OF CORRECT FORMAT FOR TWO PAPERS (this is how your output should look):\\n"
-                f"1. Title: Deep Learning for Molecules and Materials\\n"
-                f"   Abstract: This paper reviews the application of deep learning in chemistry and materials science, covering areas like property prediction and generative models.\\n"
-                f"2. Title: The Role of Catalysis in Green Chemistry\\n"
-                f"   Abstract: Explores various catalytic methods that contribute to environmentally friendly chemical processes, reducing waste and energy consumption.\\n\\n"
+                f"EXAMPLE OF PERFECTLY CORRECT FORMAT FOR TWO SUGGESTED PAPERS:\n"
+                f"1. Title: Deep Learning for Molecules and Materials\n"
+                f"   Abstract: This paper reviews the application of deep learning in chemistry and materials science, covering areas like property prediction and generative models.\n"
+                f"2. Title: The Role of Catalysis in Green Chemistry\n"
+                f"   Abstract: (From database): Explores various catalytic methods that contribute to environmentally friendly chemical processes, reducing waste and energy consumption.\n\n"
 
-                f"FURTHER OVERALL RESPONSE RULES:\\n"
-                f"- Your response MUST ONLY contain the numbered list of your suggested titles and their abstracts, following the CRITICAL OUTPUT FORMATTING RULES. Nothing else before or after this list.\\n"
-                f"- If you cannot confidently generate a meaningful abstract for a title you suggest, use 'Abstract: General suggestion based on topic; specific abstract not available.' for that paper's abstract line.\\n"
-                f"- If you cannot find any relevant papers to suggest from your knowledge, respond ONLY with the exact phrase: 'I am unable to suggest specific papers from my current knowledge based on your query.' (This exact phrase, and nothing else).\\n"
-                f"- Do NOT include conversational introductions, closings (like 'I hope this helps!'), meta-commentary, or self-references (unless using the specific inability phrase above)."
+                f"MANDATORY OVERALL RESPONSE RULES:\n"
+                f"- Your response MUST ONLY contain the numbered list of your suggested titles and their corresponding abstracts, strictly following ALL CRITICAL OUTPUT FORMATTING RULES above. Nothing else should appear in your response, either before or after this list.\n"
+                f"- If, for a specific title YOU suggest, you cannot confidently generate a meaningful abstract (and no database content is usable), use the phrase 'General suggestion based on topic; specific abstract not available.' as the abstract content for that paper's abstract line.\n"
+                f"- If, after careful consideration, you determine you cannot find or generate ANY relevant paper titles to suggest based on the user's query and your knowledge, your entire response MUST consist ONLY of the exact phrase: 'I am unable to suggest specific papers from my current knowledge based on your query.' (This exact phrase, and absolutely nothing else).\n"
+                f"- Do NOT include any conversational introductions (e.g., 'Sure, here are some papers...'), closings (e.g., 'I hope this helps!'), meta-commentary about your process, or self-references (unless it's the specific 'unable to suggest' phrase above)."
             )
     
     # Determine which instruction to use
@@ -792,11 +795,24 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     
     if not DEBUG_SKIP_AUGMENTATION:
         if not DEBUG_SKIP_RAG_CONTEXT: # Check RAG skip flag
+            # If it's a paper query with Gemini titles, the instruction tells Gemma
+            # to process titles from 'contextual_info_for_llm_about_papers' (which is the list of titles)
+            # and look for abstracts in 'ADDITIONAL CONTEXT FROM DOCUMENT DATABASE'.
             if is_paper_query and contextual_info_for_llm_about_papers and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
-                prompt_for_gemma += f"{contextual_info_for_llm_about_papers}\\n\\n" # Add the specific paper context
-            elif retrieved_context_str_for_prompt: # General RAG context
+                prompt_for_gemma += contextual_info_for_llm_about_papers # Add the "PAPER TITLES TO PROCESS" list
+                
+                # Now, critically add the actual RAG context (abstracts from FAISS) for these papers if available
+                if retrieved_context_str_for_prompt:
+                     prompt_for_gemma += f"ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):\\n{retrieved_context_str_for_prompt}\\n\\n"
+                else:
+                    # This means Gemini suggested titles, but FAISS found no matches for them,
+                    # or final_rag_documents_for_prompt was empty. Gemma will have to generate all abstracts.
+                    logger.info("Paper query with Gemini titles, but no RAG documents from FAISS to provide as context. Gemma will generate abstracts.")
+
+            elif retrieved_context_str_for_prompt: # General RAG context for other cases (e.g., not a paper query with Gemini titles, or paper query but no Gemini titles from Gemini API)
                 prompt_for_gemma += f"ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):\\n{retrieved_context_str_for_prompt}\\n\\n"
             else:
+                # No RAG context to add at all (e.g., FAISS is empty, or no query, or RAG was skipped by debug flags)
                 logger.info("DEBUG: No RAG context (neither specific paper context nor general) to add.")
         else:
             logger.warning("DEBUG_SKIP_RAG_CONTEXT is TRUE: Skipping RAG context in Gemma prompt.")
@@ -807,7 +823,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             if processed_titles_for_llm_instruction:
                 logger.info("DEBUG: Gemini paper titles are included in 'PAPER TITLES TO PROCESS' within the instruction.")
             else:
-                logger.info("DEBUG: Paper query, but no Gemini paper titles were prepared for the instruction.")
+                logger.info("DEBUG: Paper query, but no Gemini paper titles were prepared for the instruction (LLM will suggest its own).")
         elif is_paper_query and DEBUG_SKIP_GEMINI_SUGGESTIONS:
              logger.warning("DEBUG_SKIP_GEMINI_SUGGESTIONS is TRUE: Skipping Gemini suggestions for instruction.")
     else:
