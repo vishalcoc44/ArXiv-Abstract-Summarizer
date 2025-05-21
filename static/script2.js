@@ -484,7 +484,11 @@ document.addEventListener('DOMContentLoaded', () => {
                         // So, we update with the full accumulated text each time.
                         botMessageParagraph.innerHTML = safeMarkdownParse(accumulatedText);
                     }
-                    chatViewContainer.scrollTop = chatViewContainer.scrollHeight;
+                    // Only auto-scroll if user is already at (or very near) the bottom
+                    const isAtBottom = (chatViewContainer.scrollHeight - chatViewContainer.scrollTop - chatViewContainer.clientHeight) < 40;
+                    if (isAtBottom) {
+                        chatViewContainer.scrollTop = chatViewContainer.scrollHeight;
+                    }
                     push(); // Read the next chunk
                 }).catch(error => {
                     console.error('Error reading stream:', error);

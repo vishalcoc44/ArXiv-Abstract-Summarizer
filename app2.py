@@ -26,34 +26,41 @@ load_dotenv()
 
 # --- Application Configuration ---
 class AppConfig:
+    # Cloud Configuration
+    CLOUD_DEPLOYMENT = os.getenv('CLOUD_DEPLOYMENT', 'False').lower() == 'true'
+    MODEL_CACHE_SIZE = int(os.getenv('MODEL_CACHE_SIZE', '1'))  # Number of model instances to cache
+    REQUEST_QUEUE_SIZE = int(os.getenv('REQUEST_QUEUE_SIZE', '100'))
+    
+    # Model Configuration
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    GEMINI_MODEL_NAME = "gemini-2.0-flash" # Updated model
+    GEMINI_MODEL_NAME = "gemini-2.0-flash"
     GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent"
-    # Construct the API URL (ensure GEMINI_API_KEY is loaded before this class is defined if used directly here)
-    # Alternatively, construct it in the function or ensure AppConfig.GEMINI_API_KEY is checked for None before use.
     
     # Model Paths & Parameters
-    LOCAL_MODEL_PATH = "gemma_1b_finetuned_q4_0.gguf"
-    # Path to the pre-built FAISS index directory (created by create_lc_faiss_index.py)
-    FAISS_INDEX_PATH = "langchain_faiss_store_optimized" 
+    LOCAL_MODEL_PATH = os.getenv('MODEL_PATH', 'gemma_1b_finetuned_q4_0.gguf')
+    FAISS_INDEX_PATH = os.getenv('FAISS_INDEX_PATH', 'langchain_faiss_store_optimized')
     
     # RAG Configuration
     EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-    N_RETRIEVED_DOCS = 3
-    LLAMA_MAX_TOKENS = 1024 # Example, adjust as needed
-    LLAMA_TEMPERATURE = 0.3
-    LLAMA_TOP_P = 0.9
+    N_RETRIEVED_DOCS = int(os.getenv('N_RETRIEVED_DOCS', '3'))
+    LLAMA_MAX_TOKENS = int(os.getenv('LLAMA_MAX_TOKENS', '4096'))  # Increased for larger output
+    LLAMA_TEMPERATURE = float(os.getenv('LLAMA_TEMPERATURE', '0.3'))
+    LLAMA_TOP_P = float(os.getenv('LLAMA_TOP_P', '0.9'))
     
     # Llama.cpp model parameters
-    LLAMA_N_CTX = 4096
-    LLAMA_N_GPU_LAYERS = 0 
-    LLAMA_VERBOSE = False
+    LLAMA_N_CTX = int(os.getenv('LLAMA_N_CTX', '16384'))  # Increased for larger input context window
+    LLAMA_N_GPU_LAYERS = int(os.getenv('LLAMA_N_GPU_LAYERS', '0'))
+    LLAMA_VERBOSE = os.getenv('LLAMA_VERBOSE', 'False').lower() == 'true'
 
     # Flask App settings
-    FLASK_DEBUG = True
-    FLASK_HOST = '0.0.0.0'
-    FLASK_PORT = 5001
-    DATABASE_URL = 'chat_app.db'
+    FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    FLASK_HOST = os.getenv('FLASK_HOST', '0.0.0.0')
+    FLASK_PORT = int(os.getenv('FLASK_PORT', '5001'))
+    DATABASE_URL = os.getenv('DATABASE_URL', 'chat_app.db')
+    
+    # Cloud specific settings
+    REDIS_URL = os.getenv('REDIS_URL')  # For session management in cloud
+    CLOUD_STORAGE_BUCKET = os.getenv('CLOUD_STORAGE_BUCKET')  # For storing models in cloud
 
 # --- Global dictionary for cancellation events ---
 active_cancellation_events = {} # Key: chat_id, Value: threading.Event()
@@ -85,37 +92,69 @@ faiss_index = None
 embeddings_model = None
 # gemini_model = None # This was for the SDK
 
-# --- Cleanup function for Llama model ---
-def cleanup_local_llm():
-    global local_llm
-    if local_llm is not None:
-        logger.info("Cleaning up local Llama model...")
-        try:
-            # Accessing internal _model and _ctx might be needed if no public close() method exists
-            # However, llama-cpp-python's Llama object should handle this in its __del__ or a close method.
-            # For now, let's assume __del__ should work if the object is valid.
-            # Setting to None will help trigger garbage collection if it hasn't happened.
-            # A more explicit model.close() or model.free() would be better if available.
-            # The Llama object itself has a context manager, so if it were used like:
-            # with Llama(...) as llm: # it would auto-cleanup.
-            # Since it's global, we do this.
-            if hasattr(local_llm, 'close'): # Check if a close method exists (newer versions might)
-                local_llm.close()
-            elif hasattr(local_llm, '_model') and local_llm._model is not None: # Attempt more direct cleanup if no close()
-                 logger.info("Attempting to free model via internal attributes as no close() method found.")
-                 # This is risky and depends on llama-cpp-python internals if they haven't exposed a clean .close()
-                 # Forcing __del__ by removing reference
-                 del local_llm
-                 local_llm = None
-            else:
-                 del local_llm # Fallback to hoping __del__ handles it
-                 local_llm = None
-            logger.info("Local Llama model cleanup attempt finished.")
-        except Exception as e:
-            logger.error(f"Error during local_llm cleanup: {e}", exc_info=True)
+# --- Model Management for Cloud Deployment ---
+class ModelManager:
+    _instance = None
+    _model_cache = {}
+    _model_lock = threading.Lock()
 
-# Register the cleanup function to be called at exit
-atexit.register(cleanup_local_llm)
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = ModelManager()
+        return cls._instance
+
+    def __init__(self):
+        self.request_queue = []
+        if AppConfig.REDIS_URL:
+            import redis
+            self.redis_client = redis.from_url(AppConfig.REDIS_URL)
+        else:
+            self.redis_client = None
+
+    def get_model(self):
+        with self._model_lock:
+            if not self._model_cache:
+                self._initialize_model()
+            return self._model_cache.get('model')
+
+    def _initialize_model(self):
+        try:
+            # If in cloud, check if model needs to be downloaded from cloud storage
+            if AppConfig.CLOUD_DEPLOYMENT and AppConfig.CLOUD_STORAGE_BUCKET:
+                self._download_model_from_cloud()
+            
+            model = Llama(
+                model_path=AppConfig.LOCAL_MODEL_PATH,
+                n_ctx=AppConfig.LLAMA_N_CTX,
+                n_gpu_layers=AppConfig.LLAMA_N_GPU_LAYERS,
+                verbose=AppConfig.LLAMA_VERBOSE
+            )
+            self._model_cache['model'] = model
+            logger.info("Model initialized and cached successfully")
+        except Exception as e:
+            logger.error(f"Error initializing model: {e}", exc_info=True)
+            raise
+
+    def _download_model_from_cloud(self):
+        if not os.path.exists(AppConfig.LOCAL_MODEL_PATH):
+            try:
+                from google.cloud import storage
+                client = storage.Client()
+                bucket = client.bucket(AppConfig.CLOUD_STORAGE_BUCKET)
+                blob = bucket.blob(os.path.basename(AppConfig.LOCAL_MODEL_PATH))
+                blob.download_to_filename(AppConfig.LOCAL_MODEL_PATH)
+                logger.info(f"Downloaded model from cloud storage: {AppConfig.LOCAL_MODEL_PATH}")
+            except Exception as e:
+                logger.error(f"Error downloading model from cloud: {e}", exc_info=True)
+                raise
+
+    def cleanup(self):
+        with self._model_lock:
+            if 'model' in self._model_cache:
+                cleanup_local_llm()
+                del self._model_cache['model']
+                logger.info("Model cleaned up and removed from cache")
 
 # --- System Initialization Status Flags ---
 systems_status = {
@@ -126,29 +165,40 @@ systems_status = {
 
 # --- Helper Functions ---
 def initialize_systems():
-    global local_llm, faiss_index, embeddings_model # removed gemini_model from globals for SDK
+    global local_llm, faiss_index, embeddings_model
     logger.info("Initializing systems...")
 
-    # 1. Initialize Llama.cpp model
-    if os.path.exists(AppConfig.LOCAL_MODEL_PATH):
+    # Initialize model through ModelManager if in cloud deployment
+    if AppConfig.CLOUD_DEPLOYMENT:
         try:
-            logger.info(f"Loading local GGUF model from: {AppConfig.LOCAL_MODEL_PATH}")
-            local_llm = Llama(
-                model_path=AppConfig.LOCAL_MODEL_PATH,
-                n_ctx=AppConfig.LLAMA_N_CTX,
-                n_gpu_layers=AppConfig.LLAMA_N_GPU_LAYERS,
-                verbose=AppConfig.LLAMA_VERBOSE
-            )
-            logger.info("Local GGUF model loaded successfully.")
-            systems_status["local_llm_loaded"] = True
+            model_manager = ModelManager.get_instance()
+            local_llm = model_manager.get_model()
+            systems_status["local_llm_loaded"] = bool(local_llm)
         except Exception as e:
-            logger.error(f"Error loading local GGUF model: {e}", exc_info=True)
+            logger.error(f"Error initializing model through ModelManager: {e}", exc_info=True)
             local_llm = None
             systems_status["local_llm_loaded"] = False
     else:
-        logger.warning(f"Local model file not found at {AppConfig.LOCAL_MODEL_PATH}. Local model will not be available.")
-        local_llm = None
-        systems_status["local_llm_loaded"] = False
+        # Original local model initialization code
+        if os.path.exists(AppConfig.LOCAL_MODEL_PATH):
+            try:
+                logger.info(f"Loading local GGUF model from: {AppConfig.LOCAL_MODEL_PATH}")
+                local_llm = Llama(
+                    model_path=AppConfig.LOCAL_MODEL_PATH,
+                    n_ctx=AppConfig.LLAMA_N_CTX,
+                    n_gpu_layers=AppConfig.LLAMA_N_GPU_LAYERS,
+                    verbose=AppConfig.LLAMA_VERBOSE
+                )
+                logger.info("Local GGUF model loaded successfully.")
+                systems_status["local_llm_loaded"] = True
+            except Exception as e:
+                logger.error(f"Error loading local GGUF model: {e}", exc_info=True)
+                local_llm = None
+                systems_status["local_llm_loaded"] = False
+        else:
+            logger.warning(f"Local model file not found at {AppConfig.LOCAL_MODEL_PATH}. Local model will not be available.")
+            local_llm = None
+            systems_status["local_llm_loaded"] = False
 
     # 2. Initialize RAG components (Embedding Model and FAISS Index)
     try:
@@ -641,7 +691,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
         "top_p": 0.8,       
         "top_k": 40,        
         "repeat_penalty": 1.15, 
-        "max_tokens": 500,   # Temporarily increased for debugging empty response
+        "max_tokens": AppConfig.LLAMA_MAX_TOKENS,   # Increased for larger output
         "stop": stop_sequences_general
     }
 
