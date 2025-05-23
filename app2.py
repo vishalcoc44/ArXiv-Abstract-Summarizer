@@ -42,13 +42,13 @@ class AppConfig:
     
     # RAG Configuration
     EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-    N_RETRIEVED_DOCS = int(os.getenv('N_RETRIEVED_DOCS', '3'))
-    LLAMA_MAX_TOKENS = int(os.getenv('LLAMA_MAX_TOKENS', '4096'))  # Increased for larger output
+    N_RETRIEVED_DOCS = int(os.getenv('N_RETRIEVED_DOCS', '10'))
+    LLAMA_MAX_TOKENS = int(os.getenv('LLAMA_MAX_TOKENS', '8192'))  # Increased from 4096
     LLAMA_TEMPERATURE = float(os.getenv('LLAMA_TEMPERATURE', '0.3'))
     LLAMA_TOP_P = float(os.getenv('LLAMA_TOP_P', '0.9'))
     
     # Llama.cpp model parameters
-    LLAMA_N_CTX = int(os.getenv('LLAMA_N_CTX', '16384'))  # Increased for larger input context window
+    LLAMA_N_CTX = int(os.getenv('LLAMA_N_CTX', '8192'))  # Increased from 4092
     LLAMA_N_GPU_LAYERS = int(os.getenv('LLAMA_N_GPU_LAYERS', '0'))
     LLAMA_VERBOSE = os.getenv('LLAMA_VERBOSE', 'False').lower() == 'true'
 
@@ -436,6 +436,108 @@ def get_gemini_paper_suggestions(user_query_for_gemini: str) -> list[dict[str, s
         logger.error(f"Error calling or parsing Gemini for paper suggestions: {e}", exc_info=True)
         return []
 
+def fetch_wikipedia_summary(query: str) -> str:
+    """
+    Fetches a summary from Wikipedia for a given query.
+    Returns the summary as a string, or an error/not found message.
+    """
+    SESSION_TIMEOUT = 10 # seconds for requests
+    WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+    # It's good practice to set a User-Agent. Replace with your app's info if deploying.
+    headers = {
+        "User-Agent": "ChatApp/1.0 (Flask_App; https://example.com/contact or mailto:user@example.com)"
+    }
+
+    # Step 1: Search for the query to get a page title
+    search_params = {
+        "action": "query",
+        "format": "json",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": 1, # Get only the top result
+        "srprop": ""  # We don't need snippets from the search results themselves
+    }
+    search_data = {} # Initialize in case of early exit
+
+    try:
+        logger.info(f"Searching Wikipedia for: '{query[:100]}...'")
+        search_response = requests.get(WIKIPEDIA_API_URL, params=search_params, headers=headers, timeout=SESSION_TIMEOUT)
+        search_response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
+        search_data = search_response.json()
+
+        if not search_data.get("query", {}).get("search"):
+            logger.info(f"No Wikipedia search results found for: '{query[:100]}...'")
+            return f"No Wikipedia article found for '{query}'."
+        
+        page_title = search_data["query"]["search"][0]["title"]
+        logger.info(f"Found Wikipedia page title: '{page_title}' for query: '{query[:100]}...'")
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Wikipedia API search request timed out for query '{query[:100]}...'", exc_info=True)
+        return f"Error: The request to Wikipedia timed out while searching for '{query}'."
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Wikipedia API search request failed for query '{query[:100]}...': {e}", exc_info=True)
+        return f"Error: Could not connect to Wikipedia to search for '{query}'."
+    except (KeyError, IndexError) as e:
+        logger.error(f"Error parsing Wikipedia search results for query '{query[:100]}...': {e} - Data: {search_data}", exc_info=True)
+        return f"Error: Could not process search results from Wikipedia for '{query}'."
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON from Wikipedia search for '{query[:100]}...': {e}", exc_info=True)
+        return f"Error: Invalid response format from Wikipedia search for '{query}'."
+
+
+    # Step 2: Get the extract (summary) of that page title
+    extract_params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts",
+        "titles": page_title,
+        "exintro": True,      # Get only the introductory section (summary)
+        "explaintext": True,  # Get plain text, not HTML
+        "exlimit": 1          # Max 1 extract for the given title
+    }
+    extract_data = {} # Initialize in case of early exit
+
+    try:
+        logger.info(f"Fetching Wikipedia extract for page title: '{page_title}'")
+        extract_response = requests.get(WIKIPEDIA_API_URL, params=extract_params, headers=headers, timeout=SESSION_TIMEOUT)
+        extract_response.raise_for_status()
+        extract_data = extract_response.json()
+
+        pages = extract_data.get("query", {}).get("pages")
+        if not pages:
+            logger.warning(f"No 'pages' data in Wikipedia extract response for title '{page_title}'. Data: {extract_data}")
+            # This can happen if the title, though found in search, is invalid for extracts (e.g. special pages)
+            return f"Error: Could not retrieve summary content from Wikipedia for the article '{page_title}'."
+
+        # The page ID is dynamic (e.g., "736"), so we get the first (and only) page ID from the 'pages' object
+        page_id = next(iter(pages)) # Gets the first key from the pages dictionary
+        summary = pages[page_id].get("extract", "").strip()
+
+        if not summary:
+            # This could happen for disambiguation pages, very short articles, or protected pages.
+            logger.info(f"Empty summary returned from Wikipedia for page title: '{page_title}'")
+            return f"No summary found on Wikipedia for the article '{page_title}'. It might be a disambiguation page, very short, or require specific permissions to view."
+        
+        logger.info(f"Successfully fetched Wikipedia summary for '{page_title}' (length: {len(summary)} chars).")
+        return summary
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Wikipedia API extract request timed out for title '{page_title}'", exc_info=True)
+        return f"Error: The request to Wikipedia timed out while fetching the summary for '{page_title}'."
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Wikipedia API extract request failed for title '{page_title}': {e}", exc_info=True)
+        return f"Error: Could not connect to Wikipedia to get summary for '{page_title}'."
+    except (KeyError, StopIteration) as e: # StopIteration for next(iter(pages)) if pages is unexpectedly empty or malformed
+        logger.error(f"Error parsing Wikipedia extract results for title '{page_title}': {e} - Data: {extract_data}", exc_info=True)
+        return f"Error: Could not process summary from Wikipedia for '{page_title}'."
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON from Wikipedia extract for '{page_title}': {e}", exc_info=True)
+        return f"Error: Invalid response format from Wikipedia extract for '{page_title}'."
+    except Exception as e_gen: # Catch any other unexpected errors
+        logger.error(f"An unexpected error occurred in fetch_wikipedia_summary for title '{page_title}': {e_gen}", exc_info=True)
+        return f"An unexpected error occurred while fetching the Wikipedia summary for '{page_title}'."
+
 # --- Helper function for semantic similarity (NEW) ---
 def are_texts_semantically_similar(text1: str, text2: str, threshold: float = 0.85) -> bool:
     """Checks if two texts are semantically similar using embeddings and cosine similarity."""
@@ -485,207 +587,368 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
         yield "The local GGUF model is not loaded. Cannot generate a response."
         return
 
-    logger.info(f"Received in generate_local_rag_response: {user_query_with_history}")
+    logger.info(f"Received in generate_local_rag_response (Gemma): {user_query_with_history}")
 
     lines = user_query_with_history.strip().split('\\n')
-    actual_user_question = lines[-1] if lines else ""
-    conversation_log_for_prompt = "\\n".join(lines[:-1]) if len(lines) > 1 else "No previous conversation."
+    # actual_user_question = lines[-1] if lines else "" # Old way
+    raw_last_line = lines[-1] if lines else ""
+    actual_user_question = "" # Initialize
+    if raw_last_line.startswith("User: "):
+        actual_user_question = raw_last_line[len("User: "):].strip()
+    elif raw_last_line.startswith("Assistant: "): # Should be rare for the last line
+        actual_user_question = raw_last_line[len("Assistant: "):].strip()
+    else:
+        actual_user_question = raw_last_line.strip() # Fallback if no prefix
+    
+    logger.info(f"Parsed actual_user_question for Gemma: '{actual_user_question}'")
 
+    # Construct conversation history for Gemma prompt (excluding current query)
+    conversation_history_for_gemma_prompt = []
+    if len(lines) > 1:
+        for line in lines[:-1]: # Iterate over all lines except the last one (current query)
+            if line.startswith("User: "):
+                conversation_history_for_gemma_prompt.append(f"<start_of_turn>user\\n{line[len('User: '):].strip()}<end_of_turn>")
+            elif line.startswith("Assistant: "):
+                conversation_history_for_gemma_prompt.append(f"<start_of_turn>model\\n{line[len('Assistant: '):].strip()}<end_of_turn>")
+            # else: # Skip lines that don't conform to expected "User: " or "Assistant: "
+                # logger.debug(f"Skipping non-standard line in history: {line}")
+    
+    conversation_log_str_for_gemma = "\\n".join(conversation_history_for_gemma_prompt) if conversation_history_for_gemma_prompt else ""
     # --- Phase 1: General RAG (FAISS Document Retrieval based on user query) ---
     general_retrieved_documents_from_faiss = [] # Stores Langchain Document objects
-    if systems_status["faiss_index_loaded"] and faiss_index and actual_user_question:
+    if systems_status["faiss_index_loaded"] and faiss_index and actual_user_question and not DEBUG_SKIP_RAG_CONTEXT:
         try:
             logger.info(f"Performing general FAISS similarity search for: '{actual_user_question[:100]}...'")
-            retrieved_documents = faiss_index.similarity_search(actual_user_question, k=AppConfig.N_RETRIEVED_DOCS + 2) 
+            # Fetched k slightly increased to allow more candidates for deduplication
+            retrieved_documents = faiss_index.similarity_search(actual_user_question, k=AppConfig.N_RETRIEVED_DOCS + 5) 
             if retrieved_documents:
                 seen_titles = set()
                 temp_unique_docs = []
                 for doc in retrieved_documents:
                     title = doc.metadata.get('title', '').strip()
                     normalized_title = title.lower()
+                    # Basic title deduplication
                     if title and normalized_title not in seen_titles:
                         temp_unique_docs.append(doc)
                         seen_titles.add(normalized_title)
-                    elif not title:
+                    elif not title: # If no title, still add it (might be pure text content)
                         temp_unique_docs.append(doc)
-                general_retrieved_documents_from_faiss = temp_unique_docs # These are already somewhat deduplicated by title
+                general_retrieved_documents_from_faiss = temp_unique_docs
                 logger.info(f"General FAISS search initially retrieved {len(general_retrieved_documents_from_faiss)} documents (after basic title dedupe).")
             else:
                 logger.info("No documents retrieved from general FAISS search for the query.")
         except Exception as e_faiss:
             logger.error(f"Error during general FAISS retrieval: {e_faiss}", exc_info=True)
+    elif DEBUG_SKIP_RAG_CONTEXT:
+        logger.info("DEBUG_SKIP_RAG_CONTEXT is true. Skipping general RAG retrieval.")
     else:
         logger.info("FAISS index not loaded or query is empty. Skipping general RAG retrieval.")
 
     query_lower = actual_user_question.lower()
-    is_paper_query = any(keyword in query_lower for keyword in ["paper", "suggest", "recommend", "article", "publication", "study", "research"])
+    # Adjusted keywords for paper queries, more specific
+    is_paper_query = any(keyword in query_lower for keyword in ["paper", "papers", "suggest paper", "recommend paper", "find paper", "arxiv", "top 5 paper", "top 10 paper", "research article", "publication on"])
 
-    # --- Phase 1: Gemini Paper Candidate Generation (Task 2 - Part 1) ---
-    unique_gemini_paper_suggestions = [] 
-    processed_titles_for_llm_instruction = "" # New variable for LLM instruction list
-    contextual_info_for_llm_about_papers = "" # New variable for context about papers for LLM
+    # --- Gemini Paper Candidate Generation ---
+    gemini_arxiv_papers_info = [] # Will store list of dicts: {'title': '', 'authors': [], 'abstract': '', 'arxiv_id': ''}
 
     if is_paper_query and systems_status["gemini_model_configured"] and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
-        logger.info(f"Paper query detected. Attempting to get suggestions from Gemini for: '{actual_user_question[:100]}...'")
+        logger.info(f"Paper query detected. Getting ArXiv paper suggestions from Gemini for: '{actual_user_question[:100]}...'")
+        
+        # Refined prompt for Gemini to get ArXiv paper details
+        gemini_arxiv_prompt = (
+            f"Based on the user query: '{actual_user_question}', "
+            f"Please provide a list of 3 to 5 highly relevant academic paper suggestions strictly from ArXiv. "
+            f"For each paper, provide the following details in a structured format (e.g., JSON-like or clearly delimited sections per paper): "
+            f"1. Exact Title. "
+            f"2. List of Authors (e.g., ['Author A', 'Author B']). "
+            f"3. A concise Abstract (typically the one from ArXiv). "
+            f"4. The ArXiv ID (e.g., '2310.06825' or 'cs.CL/2310.06825'). "
+            f"If you cannot find 3-5 relevant papers from ArXiv or cannot find all details, provide what you can. "
+            f"If no relevant ArXiv papers are found, respond with ONLY the phrase 'NO_ARXIV_PAPERS_FOUND'."
+        )
+        
         try:
-            gemini_papers_raw = get_gemini_paper_suggestions(actual_user_question)
-            if gemini_papers_raw:
-                seen_gemini_titles = set()
-                for paper in gemini_papers_raw:
-                    title = paper.get('title', '').strip()
-                    normalized_title = title.lower()
-                    if title and normalized_title not in seen_gemini_titles:
-                        unique_gemini_paper_suggestions.append(paper) # Store the dicts
-                        seen_gemini_titles.add(normalized_title)
-                
-                if unique_gemini_paper_suggestions:
-                    logger.info(f"Gemini suggested {len(unique_gemini_paper_suggestions)} unique papers initially.")
-                    # Create a simple list of titles (with arXiv if present) for the instruction
-                    simple_title_list = []
-                    for paper in unique_gemini_paper_suggestions:
-                        title = paper.get('title', '')
-                        arxiv_id = paper.get('arxiv_id')
-                        full_title_str = f"{title}{f' (arXiv:{arxiv_id})' if arxiv_id else ''}"
-                        simple_title_list.append(full_title_str.strip())
-                    
-                    # This list is for the LLM to iterate over in its instructions
-                    processed_titles_for_llm_instruction = "\\n".join([f"{i+1}. {t}" for i, t in enumerate(simple_title_list)])
+            # Use a unique chat_id for this sub-query to avoid interference if cancellation is implemented per chat_id
+            gemini_sub_query_chat_id = f"gemini_arxiv_sub_query_{chat_id or 'new_chat'}"
+            
+            # Ensure active_cancellation_events has an entry for this sub-query if generate_gemini_response uses it
+            # This part might need to be adapted based on how cancellation is managed globally.
+            # For now, assuming generate_gemini_response can handle a chat_id without a pre-existing event or creates one.
+            if chat_id and chat_id not in active_cancellation_events: # If main chat has an event, maybe reuse/derive?
+                 # active_cancellation_events[gemini_sub_query_chat_id] = threading.Event() # Example
+                 pass
+
+
+            gemini_response_stream = generate_gemini_response(gemini_arxiv_prompt, chat_id=gemini_sub_query_chat_id)
+            full_gemini_text_response = "".join([chunk for chunk in gemini_response_stream if isinstance(chunk, str)]).strip()
+            logger.debug(f"Full raw response from Gemini for ArXiv suggestions: {full_gemini_text_response}")
+
+            if "NO_ARXIV_PAPERS_FOUND" in full_gemini_text_response or not full_gemini_text_response:
+                logger.info("Gemini indicated no ArXiv suggestions found or returned an empty response.")
             else:
-                logger.info("No paper suggestions returned from Gemini.")
-        except Exception as e_gemini_sugg:
-            logger.error(f"Error getting paper suggestions from Gemini: {e_gemini_sugg}", exc_info=True)
-    elif is_paper_query:
-        logger.info("Paper query, but Gemini is not configured. Skipping Gemini suggestions.")
+                # Enhanced parsing for ArXiv details. This is a best-effort parser.
+                # Ideally, Gemini would return structured JSON if its API allows that reliably.
+                papers_data_str = full_gemini_text_response.split("---") # Assuming "---" separates papers if not JSON
+                current_paper_details = {}
+                
+                # Regex patterns for better extraction
+                title_re = re.compile(r"^\s*(?:[0-9]+\.\s*)?Title:(.*)", re.IGNORECASE | re.MULTILINE)
+                authors_re = re.compile(r"^\s*Authors:(.*)", re.IGNORECASE | re.MULTILINE)
+                abstract_re = re.compile(r"^\s*Abstract:(.*)", re.IGNORECASE | re.MULTILINE)
+                arxiv_id_re = re.compile(r"^\s*ArXiv ID:(.*)", re.IGNORECASE | re.MULTILINE)
 
-    # --- Phase 2: Targeted RAG (FAISS Retrieval based on Gemini Suggestions) ---
-    targeted_faiss_documents = []
-    if systems_status["faiss_index_loaded"] and faiss_index and unique_gemini_paper_suggestions:
-        logger.info(f"Performing targeted FAISS search for {len(unique_gemini_paper_suggestions)} Gemini suggestions.")
-        seen_targeted_faiss_titles_normalized = set() # Deduplicate titles found via this targeted search
-        for paper_suggestion in unique_gemini_paper_suggestions:
-            title_to_search = paper_suggestion.get("title")
-            if title_to_search:
+                # Try to parse as JSON first, as it's more reliable
                 try:
-                    docs = faiss_index.similarity_search(title_to_search, k=1) # Fetch top 1 for precision
-                    if docs:
-                        # Check if this doc is distinct enough before adding
-                        doc_from_targeted_search = docs[0]
-                        doc_title = doc_from_targeted_search.metadata.get("title", "").strip()
-                        normalized_doc_title = doc_title.lower()
-
-                        if normalized_doc_title and normalized_doc_title not in seen_targeted_faiss_titles_normalized:
-                            # Further check: is the found FAISS title semantically similar to the Gemini title?
-                            if are_texts_semantically_similar(title_to_search, doc_title, threshold=0.85): # Threshold for title matching
-                                targeted_faiss_documents.append(doc_from_targeted_search)
-                                seen_targeted_faiss_titles_normalized.add(normalized_doc_title)
-                                logger.debug(f"Targeted FAISS found relevant doc for '{title_to_search}': '{doc_title}'")
-                            else:
-                                logger.debug(f"Targeted FAISS found doc '{doc_title}' for '{title_to_search}', but titles not semantically similar enough.")
-                        elif doc_title:
-                             logger.debug(f"Targeted FAISS found doc '{doc_title}' for '{title_to_search}', but it was a title-duplicate of another targeted result.")
-                except Exception as e_targeted_faiss:
-                    logger.error(f"Error during targeted FAISS search for title '{title_to_search}': {e_targeted_faiss}", exc_info=True)
-        logger.info(f"Retrieved {len(targeted_faiss_documents)} documents from targeted FAISS search.")
-
-    # --- Combine and Deduplicate RAG Context (Task 1 Enhancement) ---
-    final_rag_documents_for_prompt = []
-    final_seen_content_snippets_for_semantic_check = [] # Store snippets of content for semantic dedupe
-    final_seen_titles_normalized = set() # Store normalized titles for title-based dedupe
-
-    # Priority to targeted FAISS documents (these are from Gemini's suggestions)
-    for doc in targeted_faiss_documents:
-        if len(final_rag_documents_for_prompt) >= AppConfig.N_RETRIEVED_DOCS:
-            break
-        title = doc.metadata.get("title", "").strip()
-        normalized_title = title.lower()
-        page_content_str = str(doc.page_content if doc.page_content is not None else "")
-        content_snippet_for_check = page_content_str[:300] # Use a larger snippet for semantic check
-
-        is_semantically_dupe = False
-        for existing_snippet in final_seen_content_snippets_for_semantic_check:
-            if are_texts_semantically_similar(content_snippet_for_check, existing_snippet, threshold=0.90): # Stricter for pre-LLM
-                is_semantically_dupe = True
-                logger.info(f"Skipping (semantic duplicate) targeted FAISS doc: '{title}'")
-                break
+                    parsed_json_data = json.loads(full_gemini_text_response)
+                    # Assuming parsed_json_data is a list of paper dicts or a dict containing them
+                    if isinstance(parsed_json_data, list):
+                        for paper_data_entry in parsed_json_data:
+                            if isinstance(paper_data_entry, dict) and "title" in paper_data_entry and "arxiv_id" in paper_data_entry and "abstract" in paper_data_entry:
+                                gemini_arxiv_papers_info.append({
+                                    "title": paper_data_entry.get("title", "").strip(),
+                                    "authors": paper_data_entry.get("authors", []), # Assuming authors is a list
+                                    "abstract": paper_data_entry.get("abstract", "").strip(),
+                                    "arxiv_id": paper_data_entry.get("arxiv_id", "").strip()
+                                })
+                        logger.info(f"Successfully parsed {len(gemini_arxiv_papers_info)} ArXiv papers from Gemini JSON response.")
+                    # Add more specific JSON structure handling if needed
+                except json.JSONDecodeError:
+                    logger.info("Gemini response for ArXiv papers was not valid JSON. Falling back to text parsing.")
+                    # Fallback to text parsing
+                    for paper_block in re.split(r'\n\s*\d+\.\s*Title:|\n\s*Title:', '\n' + full_gemini_text_response): # Split by "1. Title:" or "Title:"
+                        if not paper_block.strip():
+                            continue
                         
-        if normalized_title not in final_seen_titles_normalized and not is_semantically_dupe:
-            final_rag_documents_for_prompt.append(doc)
-            final_seen_titles_normalized.add(normalized_title)
-            final_seen_content_snippets_for_semantic_check.append(content_snippet_for_check)
-        elif title and normalized_title in final_seen_titles_normalized:
-            logger.info(f"Skipping (title duplicate) targeted FAISS doc: '{title}'")
+                        paper_data = {}
+                        # Re-prepend "Title:" because the split might remove it for the first block
+                        # and for subsequent blocks, the split point is before "Title:"
+                        search_block = "Title: " + paper_block 
 
-    # Add general RAG documents if space allows and they are distinct
-    remaining_slots = AppConfig.N_RETRIEVED_DOCS - len(final_rag_documents_for_prompt)
-    if remaining_slots > 0:
-        for doc in general_retrieved_documents_from_faiss:
-            if len(final_rag_documents_for_prompt) >= AppConfig.N_RETRIEVED_DOCS:
-                break
+                        title_match = title_re.search(search_block)
+                        if title_match: paper_data["title"] = title_match.group(1).strip()
+
+                        authors_match = authors_re.search(search_block)
+                        if authors_match:
+                            authors_list_str = authors_match.group(1).strip()
+                            # Handle potential list-like string for authors e.g. "['Author A', 'Author B']" or "Author A, Author B"
+                            if authors_list_str.startswith('[') and authors_list_str.endswith(']'):
+                                try:
+                                    paper_data["authors"] = eval(authors_list_str) # eval is risky, use ast.literal_eval if possible
+                                except: # Fallback if eval fails
+                                    paper_data["authors"] = [a.strip() for a in authors_list_str.strip('[]').split(',') if a.strip()]
+                            else:
+                                paper_data["authors"] = [a.strip() for a in authors_list_str.split(',') if a.strip()]
+                        else:
+                            paper_data["authors"] = []
+
+
+                        abstract_match = abstract_re.search(search_block)
+                        if abstract_match: paper_data["abstract"] = abstract_match.group(1).strip()
+                        
+                        arxiv_id_match = arxiv_id_re.search(search_block)
+                        if arxiv_id_match: paper_data["arxiv_id"] = arxiv_id_match.group(1).strip()
+
+                        if paper_data.get("title") and paper_data.get("arxiv_id") and paper_data.get("abstract"):
+                            gemini_arxiv_papers_info.append(paper_data)
+                        else:
+                            logger.warning(f"Could not parse all required fields from paper block: {paper_block[:100]}...")
+                    
+                    if gemini_arxiv_papers_info:
+                        logger.info(f"Parsed {len(gemini_arxiv_papers_info)} ArXiv paper suggestions from Gemini (text parsing).")
+                    else:
+                        logger.warning("Text parsing of Gemini ArXiv response yielded no structured papers.")
+
+
+        except Exception as e_gemini_arxiv:
+            logger.error(f"Error calling or parsing Gemini for ArXiv paper suggestions: {e_gemini_arxiv}", exc_info=True)
+    
+    elif is_paper_query and DEBUG_SKIP_GEMINI_SUGGESTIONS:
+         logger.info("DEBUG_SKIP_GEMINI_SUGGESTIONS is true. Skipping Gemini ArXiv paper suggestions.")
+
+    # Format Gemini ArXiv Paper Suggestions for LLM Instruction
+    processed_titles_for_llm_instruction = ""
+    contextual_info_for_llm_about_papers = "" # Initialize to empty string
+
+    if gemini_arxiv_papers_info: # Check if list is not empty
+        title_lines = []
+        for paper_info in gemini_arxiv_papers_info:
+            title_line = paper_info.get("title", "").strip()
+            arxiv_id = paper_info.get("arxiv_id", "").strip()
+            if arxiv_id:
+                title_line += f" (arXiv:{arxiv_id})"
+            if title_line: # Add only if title is not empty after stripping
+                title_lines.append(title_line)
+        
+        if title_lines: # If we actually got some valid titles
+            processed_titles_for_llm_instruction = "\\n".join(title_lines)
+            contextual_info_for_llm_about_papers = processed_titles_for_llm_instruction
+            logger.info(f"Prepared processed_titles_for_llm_instruction with {len(title_lines)} titles.")
+        else:
+            logger.info("Gemini suggested papers but all titles were empty after processing; processed_titles_for_llm_instruction remains empty.")
+    else:
+        logger.info("No Gemini ArXiv papers info to process for processed_titles_for_llm_instruction.")
+
+    # --- Phase 2: Targeted RAG (FAISS Retrieval based on Gemini ArXiv Suggestions) ---
+    targeted_faiss_documents_for_arxiv = [] # Stores dicts: {"gemini_suggestion": {}, "faiss_document": Doc}
+    if systems_status["faiss_index_loaded"] and faiss_index and gemini_arxiv_papers_info and not DEBUG_SKIP_RAG_CONTEXT:
+        logger.info(f"Performing targeted FAISS search for {len(gemini_arxiv_papers_info)} Gemini ArXiv suggestions.")
+        seen_targeted_faiss_content_snippets = [] # For semantic deduplication of content from FAISS
+
+        for paper_suggestion in gemini_arxiv_papers_info:
+            search_query_for_faiss = paper_suggestion.get("title", "")
+            arxiv_id_from_gemini = paper_suggestion.get("arxiv_id")
+            if arxiv_id_from_gemini: # Add ArXiv ID to search query if present
+                 search_query_for_faiss += f" arxiv:{arxiv_id_from_gemini}" 
+
+            if not search_query_for_faiss.strip():
+                logger.debug(f"Skipping targeted FAISS search for empty Gemini suggestion.")
+                continue
+
+            try:
+                # Fetch a few candidates to check for best match. Using similarity_search_with_score.
+                # k=3 means we get top 3 closest matches from FAISS for the `search_query_for_faiss`
+                docs_with_scores = faiss_index.similarity_search_with_score(search_query_for_faiss, k=3)
+                
+                best_match_doc_for_this_suggestion = None
+                # Score interpretation: For FAISS with default L2 distance, lower score is better.
+                # If using cosine similarity directly (e.g. via `FAISS.similarity_search_with_score_by_vector`)
+                # higher score would be better. Assuming default L2 distance here.
+                lowest_score_for_this_suggestion = float('inf') 
+
+                for doc_candidate, score in docs_with_scores:
+                    candidate_title = doc_candidate.metadata.get("title", "").strip()
+                    local_arxiv_id = doc_candidate.metadata.get("arxiv_id", "").strip() # Your FAISS stores this
+
+                    # Criterion 1: Exact ArXiv ID match (highest priority)
+                    if arxiv_id_from_gemini and local_arxiv_id and arxiv_id_from_gemini.lower() == local_arxiv_id.lower():
+                        best_match_doc_for_this_suggestion = doc_candidate
+                        logger.debug(f"Strong match by ArXiv ID for '{paper_suggestion.get('title')}': FAISS doc '{candidate_title}' (ID: {local_arxiv_id})")
+                        break # Found definitive match for this suggestion, move to next suggestion
+
+                    # Criterion 2: Semantic similarity of titles (if no ArXiv ID match yet)
+                    # Check if title from Gemini suggestion is semantically similar to title from FAISS doc
+                    # Threshold 0.80 for title similarity is reasonably strict.
+                    if are_texts_semantically_similar(paper_suggestion.get("title",""), candidate_title, threshold=0.80):
+                       if score < lowest_score_for_this_suggestion: # If titles are similar, prefer doc with lower distance score
+                           best_match_doc_for_this_suggestion = doc_candidate
+                           lowest_score_for_this_suggestion = score
+                           logger.debug(f"Potential semantic title match for '{paper_suggestion.get('title')}': FAISS doc '{candidate_title}' (Score: {score})")
+                
+                # After checking all candidates for the current Gemini suggestion:
+                if best_match_doc_for_this_suggestion:
+                    page_content_str = str(best_match_doc_for_this_suggestion.page_content if best_match_doc_for_this_suggestion.page_content is not None else "")
+                    content_snippet_for_check = page_content_str[:300] # First 300 chars for dupe check
+                    
+                    is_semantically_dupe_content = any(
+                        are_texts_semantically_similar(content_snippet_for_check, existing_snippet, threshold=0.90)
+                        for existing_snippet in seen_targeted_faiss_content_snippets
+                    )
+
+                    if not is_semantically_dupe_content:
+                        targeted_faiss_documents_for_arxiv.append({
+                            "gemini_suggestion": paper_suggestion, # Store the original Gemini suggestion dict
+                            "faiss_document": best_match_doc_for_this_suggestion # Store the found Langchain Document object
+                        })
+                        seen_targeted_faiss_content_snippets.append(content_snippet_for_check)
+                        logger.info(f"Added targeted FAISS match for Gemini suggestion (Title: '{paper_suggestion.get('title','N/A_TITLE')}').")
+                    else:
+                        logger.info(f"Targeted FAISS found doc for '{paper_suggestion.get('title','N/A_TITLE')}', but content was semantically duplicate of another *already added* targeted result.")
+                else:
+                    logger.info(f"No strong local match in FAISS found for Gemini ArXiv suggestion: '{paper_suggestion.get('title','N/A_TITLE')}'")
+
+            except Exception as e_targeted_faiss:
+                logger.error(f"Error during targeted FAISS search for suggestion '{paper_suggestion.get('title', 'N/A_TITLE')}': {e_targeted_faiss}", exc_info=True)
+        
+        logger.info(f"Finished targeted FAISS search. Found {len(targeted_faiss_documents_for_arxiv)} distinct local documents for Gemini ArXiv suggestions.")
+    
+    elif DEBUG_SKIP_RAG_CONTEXT:
+        logger.info("DEBUG_SKIP_RAG_CONTEXT is true. Skipping targeted RAG based on Gemini ArXiv suggestions.")
+    elif not gemini_arxiv_papers_info:
+        logger.info("No Gemini ArXiv papers were suggested, so skipping targeted FAISS search.")
+    else:
+        logger.info("FAISS index not loaded. Skipping targeted RAG based on Gemini ArXiv suggestions.")
+
+
+    # --- Combine and Deduplicate General RAG Context (if not a paper query or if paper RAG yielded little) ---
+    # This section populates `final_general_rag_documents_for_prompt` for non-paper queries,
+    # or as a fallback if paper-specific RAG (targeted_faiss_documents_for_arxiv) didn't find much.
+    final_general_rag_documents_for_prompt = []
+    if not DEBUG_SKIP_RAG_CONTEXT: # Check RAG skip flag
+        # Only proceed with general RAG if it's not a paper query OR 
+        # if it IS a paper query BUT the targeted search for ArXiv papers yielded no results.
+        if not is_paper_query or (is_paper_query and not targeted_faiss_documents_for_arxiv):
+            logger.info("Proceeding with general RAG context population (either not a paper query, or paper query with no targeted results).")
+            final_seen_content_snippets_for_semantic_check_general = [] 
+            final_seen_titles_normalized_general = set()
+
+            for doc in general_retrieved_documents_from_faiss: # `general_retrieved_documents_from_faiss` from earlier general search
+                if len(final_general_rag_documents_for_prompt) >= AppConfig.N_RETRIEVED_DOCS:
+                    break # Stop if we have enough documents
+                
             title = doc.metadata.get("title", "").strip()
             normalized_title = title.lower()
             page_content_str = str(doc.page_content if doc.page_content is not None else "")
             content_snippet_for_check = page_content_str[:300]
 
-            is_semantically_dupe = False
-            for existing_snippet in final_seen_content_snippets_for_semantic_check:
-                if are_texts_semantically_similar(content_snippet_for_check, existing_snippet, threshold=0.90):
-                    is_semantically_dupe = True
-                    logger.info(f"Skipping (semantic duplicate) general FAISS doc: '{title}'")
-                    break
-                            
-            if normalized_title not in final_seen_titles_normalized and not is_semantically_dupe:
-                final_rag_documents_for_prompt.append(doc)
-                final_seen_titles_normalized.add(normalized_title)
-                final_seen_content_snippets_for_semantic_check.append(content_snippet_for_check)
-            elif title and normalized_title in final_seen_titles_normalized:
-                 logger.info(f"Skipping (title duplicate) general FAISS doc: '{title}'")
+            is_semantically_dupe_content_general = any(
+                are_texts_semantically_similar(content_snippet_for_check, existing_snippet, threshold=0.90)
+                for existing_snippet in final_seen_content_snippets_for_semantic_check_general
+            )
+                                
+            # Add if: (no title OR title not seen before) AND content not semantically duplicate
+            if (not title or normalized_title not in final_seen_titles_normalized_general) and not is_semantically_dupe_content_general:
+                final_general_rag_documents_for_prompt.append(doc)
+                if title: final_seen_titles_normalized_general.add(normalized_title)
+                final_seen_content_snippets_for_semantic_check_general.append(content_snippet_for_check)
+            elif title and normalized_title in final_seen_titles_normalized_general:
+                 logger.info(f"Skipping (title duplicate) general FAISS doc for general context: '{title}'")
+            elif is_semantically_dupe_content_general:
+                logger.info(f"Skipping (semantic duplicate content) general FAISS doc for general context: '{title}'")
+            logger.info(f"Populated {len(final_general_rag_documents_for_prompt)} documents for general RAG context.")
+        else:
+            logger.info("Skipping general RAG context population because it is a paper query AND targeted ArXiv RAG yielded results.")
+            
+    elif DEBUG_SKIP_RAG_CONTEXT:
+        logger.info("DEBUG_SKIP_RAG_CONTEXT is TRUE: Skipping general RAG context in Gemma prompt.")
+    else:
+        logger.info("final_general_rag_documents_for_prompt is empty. No general RAG context string will be built for Gemma.")
 
-    # --- Construct retrieved_context_str_for_prompt from final_rag_documents_for_prompt ---
-    retrieved_context_str_for_prompt = ""
-    retrieved_docs_for_log = [] # <--- ADD THIS LINE EXACTLY HERE
-
-    # This string should *always* be built if final_rag_documents_for_prompt has content.
-    # It represents the best documents found, whether from targeted or general search.
-    if final_rag_documents_for_prompt:
+    # --- Construct retrieved_context_str_for_gemma_prompt (from General RAG documents) ---
+    # This string is intended for general queries or as fallback context for paper queries where Gemma itself forms suggestions.
+    retrieved_context_str_for_gemma_prompt = ""
+    if final_general_rag_documents_for_prompt and not DEBUG_SKIP_RAG_CONTEXT: 
         context_parts = []
-        # Current logic limits to 1 RAG doc for debugging, let's use AppConfig.N_RETRIEVED_DOCS
-        # for doc_to_add in final_rag_documents_for_prompt[:1]: # Original DEBUG limit
-        for i, doc_to_add in enumerate(final_rag_documents_for_prompt[:AppConfig.N_RETRIEVED_DOCS]):
+        for i, doc_to_add in enumerate(final_general_rag_documents_for_prompt[:AppConfig.N_RETRIEVED_DOCS]):
             content = str(doc_to_add.page_content).strip() if doc_to_add.page_content is not None else ""
             title = doc_to_add.metadata.get('title', f'Retrieved Document {i+1}')
-            # Truncate content to avoid overly long prompts
             max_content_len = 700 # Characters per RAG document in prompt
-            context_parts.append(f"Retrieved Document {i+1} (Title: {title}):\\n{content[:max_content_len]}{'...' if len(content) > max_content_len else ''}")
-            retrieved_docs_for_log.append({"title": title, "content_preview": content[:100] + "..."})
+            context_parts.append(f"Context Document {i+1} (Title: {title}):\\n{content[:max_content_len]}{'...' if len(content) > max_content_len else ''}")
             
         if context_parts:
-            retrieved_context_str_for_prompt = "\\n".join(context_parts)
-            logger.info(f"General RAG context prepared with {len(retrieved_docs_for_log)} documents for LLM.")
-        else:
-            logger.info("No general RAG documents will be added to the LLM prompt (context_parts empty).")
+            # Clearly delimit this general context for the LLM
+            retrieved_context_str_for_gemma_prompt = (
+                "\\n\\n--- Start of General Retrieved Context ---\\n"
+                + "\\n\\n".join(context_parts) + 
+                "\\n--- End of General Retrieved Context ---\\n"
+            )
+            logger.info(f"General RAG context string prepared for Gemma with {len(final_general_rag_documents_for_prompt)} documents.")
+    elif DEBUG_SKIP_RAG_CONTEXT:
+        logger.info("DEBUG_SKIP_RAG_CONTEXT is true. No general RAG context string will be built for Gemma.")
     else:
-        logger.info("final_rag_documents_for_prompt is empty. No RAG context string will be built.")
+        logger.info("final_general_rag_documents_for_prompt is empty. No general RAG context string will be built for Gemma.")
 
-    # Build the contextual_info_for_llm_about_papers if Gemini suggestions exist
-    if is_paper_query and unique_gemini_paper_suggestions and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
-        contextual_info_for_llm_about_papers = f"CONTEXT FOR PROVIDED PAPER TITLES:\\n{processed_titles_for_llm_instruction}\\n\\n"
-        logger.info("Gemini suggestions exist and will be included in the context.")
-    else:
-        contextual_info_for_llm_about_papers = ""
-        logger.info("No Gemini suggestions exist or they are being skipped.")
-
-    # --- Stop sequences ---
+    # --- Gemma Stop Sequences ---
     # These are common phrases the model might try to output that we want to stop.
     # This list can be expanded based on observed model behavior.
     stop_sequences_general = [
         "User:", "User Query:", "USER:", "ASSISTANT:", "Assistant:", "System:", 
-        "\\nUser:", "\\nUSER:", "\\nASSISTANT:", "\\nAssistant:", "\\nSystem:",
+        "\nUser:", "\nUSER:", "\nASSISTANT:", "\nAssistant:", "\nSystem:",
         "Context:", "CONTEXT:", "Answer:", "ANSWER:", "Note:", "Response:",
         "In this response,", "In summary,", "To summarize,", "Let's expand on",
         "The user is asking", "The user wants to know",
         "This text follows", "The following is a", "This is a text about",
         "My goal is to", "I am an AI assistant", "As an AI",
-        "\\n\\nHuman:", "<|endoftext|>", "<|im_end|>", "\\u202f",
+        "\n\nHuman:", "<|endoftext|>", "<|im_end|>", "\u202f",
         "STOP_ASSISTANT_PRIMING_PHRASE:" # Changed to avoid conflict with actual priming, just in case
     ]
     
@@ -723,14 +986,14 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                 f"2. Search the 'ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):' section (if present later in this prompt) for this exact title or a highly similar one. \n"
                 f"3. If a STRONG match is found in the DOCUMENT DATABASE context AND it provides relevant content/abstract:\n"
                 f"   - Use the retrieved content as the abstract for this paper. The abstract should be unique to this paper. Do NOT use placeholder text.\n"
-                f"   - Your output for this paper MUST be formatted STRICTLY as (example):\n"
+                f"   - Your output for this paper MUST be formatted STRICTLY as (example for a paper found in the database):\n"
                 f"     1. Title: [Exact Paper Title from 'PAPER TITLES TO PROCESS' (including arXiv ID if it was there)]\n"
-                f"        Abstract (from local database): [The relevant retrieved abstract/content snippet from the DOCUMENT DATABASE]\n"
+                f"        Abstract: [The relevant retrieved abstract/content snippet from the DOCUMENT DATABASE]\n"
                 f"4. If NO strong match is found in the DOCUMENT DATABASE context, OR if a match is found but it has no usable abstract:\n"
                 f"   - You MUST generate a concise, plausible, and UNIQUE abstract (1-3 sentences) for the paper based SOLELY on its title and your general knowledge. Do NOT use placeholder text. Do NOT repeat abstracts from other papers.\n"
-                f"   - Your output for this paper MUST be formatted STRICTLY as (example):\n"
+                f"   - Your output for this paper MUST be formatted STRICTLY as (example for a generated abstract):\n"
                 f"     2. Title: [Exact Paper Title from 'PAPER TITLES TO PROCESS' (including arXiv ID if it was there)]\n"
-                f"        Abstract (generated): [Your UNIQUE generated abstract based on the title]\n"
+                f"        Abstract: [Your UNIQUE generated abstract based on the title]\n"
                 f"5. If, after attempting step 4, you absolutely CANNOT generate a meaningful abstract even from the title:\n"
                 f"   - Your output for this paper MUST be formatted STRICTLY as (example):\n"
                 f"     3. Title: [Exact Paper Title from 'PAPER TITLES TO PROCESS' (including arXiv ID if it was there)]\n"
@@ -750,7 +1013,10 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             paper_specific_instruction = (
                 f"You are an AI research assistant. The user is asking for paper suggestions. "
                 f"Your task is to suggest 3 to 5 relevant academic paper titles based on the user's query and your general knowledge. "
-                f"For EACH paper title you suggest, you MUST then provide a brief, plausible-sounding abstract (1-2 sentences) specifically for that title.\n\n"
+                f"For EACH of the 3 to 5 papers you suggest, present each paper using a strict two-line format:\n"
+                f"1. The FIRST line for each paper: '[Number]. Title: [The Paper Title You Are Suggesting] '\n"
+                f"2. The SECOND line for that SAME paper (immediately following the title line): '   Abstract: [Your concise 3-4 sentence plausible abstract for THIS specific title]'\n"
+                f"Ensure the abstract is distinctly separate from the title, on its own indented line, and prefixed with 'Abstract: '. Do not merge the title and abstract onto a single line.\n\n"
                 
                 f"If general 'Retrieved Document' context is available later in this prompt, you can check if any of YOUR suggested titles coincidentally match any retrieved document titles. If a strong match exists AND the retrieved content is suitable as an abstract, you MAY use that content for the abstract, noting it by starting the abstract with '(From database): '. Otherwise, you MUST generate the abstract from your own knowledge based on the title you suggested.\n\n"
 
@@ -758,9 +1024,9 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                 f"1. Your entire response MUST begin *EXACTLY* with '1. Title: ' for the first paper you suggest. There must be NO text, preamble, or conversational phrases before this first '1. Title: ' line.\n"
                 f"2. For EACH paper you suggest (from 1 to 5 papers):\n"
                 f"   a. Start the line with the sequential paper number (e.g., 1, 2, 3), followed by a period, a single space, and then the phrase 'Title: ' followed by the paper title you are suggesting. (Example: '1. Title: Example Paper Title')\n"
-                f"   b. The paper title itself should NOT contain any literal '\\\\n' characters. If a title is long, let it wrap naturally.\n"
+                f"   b. The paper title itself should NOT contain any literal '\\n' characters. If a title is long, let it wrap naturally.\n"
                 f"   c. On the VERY NEXT LINE (achieved by outputting a single newline character '\\n' immediately after the title line, and nothing else on that line), you MUST indent with EXACTLY three spaces, then write 'Abstract: ' followed by the concise (1-2 sentences) abstract for THIS SPECIFIC TITLE.\n"
-                f"   d. The abstract content itself MUST be an actual abstract. It should NOT be conversational, nor should it be a comment about the list of papers or the suggestion process. It should NOT contain any literal '\\\\n' characters within a sentence. If the abstract is long, let it wrap naturally. Use a single newline character '\\n' ONLY to end the abstract line.\n"
+                f"   d. The abstract content itself MUST be an actual abstract. It should NOT be conversational, nor should it be a comment about the list of papers or the suggestion process. It should NOT contain any literal '\\n' characters within a sentence. If the abstract is long, let it wrap naturally. Use a single newline character '\\n' ONLY to end the abstract line.\n"
                 f"   e. After the abstract line for one paper, the next paper's 'X. Title:' line (if any) MUST start immediately on the next line. Do NOT insert any blank lines between suggested papers.\n"
                 f"   f. Do NOT use any markdown list markers (like '* ', '- ', '+ ') or any other characters at the start of the 'X. Title:' or '   Abstract:' lines other than what is explicitly specified.\n\n"
                 
@@ -790,35 +1056,50 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
 
     # --- Constructing the Final Prompt for Gemma ---
     prompt_for_gemma = f"{instruction_to_use}\\n\\n"
-    if conversation_log_for_prompt and conversation_log_for_prompt != "No previous conversation.":
-        prompt_for_gemma += f"CONVERSATION LOG:\\n{conversation_log_for_prompt}\\n\\n"
+    if conversation_log_str_for_gemma and conversation_log_str_for_gemma != "No previous conversation.":
+        prompt_for_gemma += f"CONVERSATION LOG:\\n{conversation_log_str_for_gemma}\\n\\n"
     
     if not DEBUG_SKIP_AUGMENTATION:
         if not DEBUG_SKIP_RAG_CONTEXT: # Check RAG skip flag
             # If it's a paper query with Gemini titles, the instruction tells Gemma
-            # to process titles from 'contextual_info_for_llm_about_papers' (which is the list of titles)
+            # to process titles from 'PAPER TITLES TO PROCESS' (which is `processed_titles_for_llm_instruction`)
             # and look for abstracts in 'ADDITIONAL CONTEXT FROM DOCUMENT DATABASE'.
-            if is_paper_query and contextual_info_for_llm_about_papers and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
-                prompt_for_gemma += contextual_info_for_llm_about_papers # Add the "PAPER TITLES TO PROCESS" list
+            if is_paper_query and processed_titles_for_llm_instruction and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
+                # The `processed_titles_for_llm_instruction` is already part of `paper_specific_instruction` under 'PAPER TITLES TO PROCESS'
+                # So, we only need to add the FAISS retrieved abstracts if available.
                 
-                # Now, critically add the actual RAG context (abstracts from FAISS) for these papers if available
-                if retrieved_context_str_for_prompt:
-                     prompt_for_gemma += f"ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):\\n{retrieved_context_str_for_prompt}\\n\\n"
+                # The `retrieved_context_str_for_gemma_prompt` was built from `final_general_rag_documents_for_prompt`
+                # For paper queries where Gemini provided titles, we should instead build context from `targeted_faiss_documents_for_arxiv`.
+                
+                targeted_arxiv_context_parts = []
+                if targeted_faiss_documents_for_arxiv: # This list contains {'gemini_suggestion': {}, 'faiss_document': Doc}
+                    for i, item in enumerate(targeted_faiss_documents_for_arxiv):
+                        faiss_doc_obj = item.get("faiss_document")
+                        if faiss_doc_obj:
+                            content = str(faiss_doc_obj.page_content).strip() if faiss_doc_obj.page_content is not None else ""
+                            title = faiss_doc_obj.metadata.get('title', f'Retrieved ArXiv Document {i+1}')
+                            arxiv_id_local = faiss_doc_obj.metadata.get('arxiv_id', 'N/A')
+                            max_content_len = 700 # Characters per RAG document in prompt
+                            targeted_arxiv_context_parts.append(f"Context for ArXiv Paper (Title: {title}, ID: {arxiv_id_local}):\\n{content[:max_content_len]}{'...' if len(content) > max_content_len else ''}")
+                
+                if targeted_arxiv_context_parts:
+                    final_context_for_prompt = (
+                        "\\n\\n--- ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results for suggested ArXiv papers) ---\\n"
+                        + "\\n\\n".join(targeted_arxiv_context_parts) + 
+                        "\\n--- End of ArXiv Document Database Context ---\\n"
+                    )
+                    prompt_for_gemma += final_context_for_prompt
+                    logger.info(f"Targeted ArXiv RAG context string prepared for Gemma with {len(targeted_arxiv_context_parts)} documents.")
                 else:
-                    # This means Gemini suggested titles, but FAISS found no matches for them,
-                    # or final_rag_documents_for_prompt was empty. Gemma will have to generate all abstracts.
-                    logger.info("Paper query with Gemini titles, but no RAG documents from FAISS to provide as context. Gemma will generate abstracts.")
+                    logger.info("Paper query with Gemini titles, but no targeted RAG documents from FAISS to provide as context. Gemma will generate abstracts.")
 
-            elif retrieved_context_str_for_prompt: # General RAG context for other cases (e.g., not a paper query with Gemini titles, or paper query but no Gemini titles from Gemini API)
-                prompt_for_gemma += f"ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):\\n{retrieved_context_str_for_prompt}\\n\\n"
+            elif retrieved_context_str_for_gemma_prompt: # General RAG context for other cases
+                prompt_for_gemma += f"ADDITIONAL CONTEXT FROM DOCUMENT DATABASE (curated RAG results):\\n{retrieved_context_str_for_gemma_prompt}\\n\\n"
             else:
-                # No RAG context to add at all (e.g., FAISS is empty, or no query, or RAG was skipped by debug flags)
                 logger.info("DEBUG: No RAG context (neither specific paper context nor general) to add.")
         else:
             logger.warning("DEBUG_SKIP_RAG_CONTEXT is TRUE: Skipping RAG context in Gemma prompt.")
 
-        # Gemini suggestions are now primarily handled by processed_titles_for_llm_instruction within paper_specific_instruction
-        # No need to add a separate block for gemini_suggestions_list_for_instruction here
         if is_paper_query and not DEBUG_SKIP_GEMINI_SUGGESTIONS:
             if processed_titles_for_llm_instruction:
                 logger.info("DEBUG: Gemini paper titles are included in 'PAPER TITLES TO PROCESS' within the instruction.")
@@ -832,15 +1113,18 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     prompt_for_gemma += f"USER QUERY: {actual_user_question}\\n\\nASSISTANT'S FACTUAL ANSWER:"
 
     logger.info(f"Final Prompt for Gemma (first 300 chars): {prompt_for_gemma[:300]}...")
-    logger.info(f"Full Prompt for Gemma:\\n{prompt_for_gemma}") # Uncommented for debugging
-    if retrieved_docs_for_log:
-        logger.info(f"RAG documents added to prompt: {json.dumps(retrieved_docs_for_log, indent=2)}")
-    if unique_gemini_paper_suggestions: # Log what Gemini originally suggested
-        logger.info(f"Gemini initially suggested papers: {json.dumps(unique_gemini_paper_suggestions, indent=2)}")
+    logger.info(f"Full Prompt for Gemma:\\n{prompt_for_gemma}") 
+    if gemini_arxiv_papers_info: # Log what Gemini originally suggested that led to targeted search
+        logger.info(f"Gemini initially suggested papers for targeted search: {json.dumps(gemini_arxiv_papers_info, indent=2)}")
     logger.info(f"Generation parameters for Gemma: {generation_params_general}")
 
+    cancel_event_for_llm = active_cancellation_events.get(chat_id)
+    if not cancel_event_for_llm:
+        logger.warning(f"No cancel_event found for chat_id {chat_id} in generate_local_rag_response. LLM generation will not be cancellable.")
+        cancel_event_for_llm = threading.Event() # Dummy event
+
     try:
-        stream = local_llm.create_chat_completion( # Corrected method call
+        stream = local_llm.create_chat_completion( 
             messages=[{"role": "user", "content": prompt_for_gemma}],
             **generation_params_general,
             stream=True
@@ -848,15 +1132,21 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
         
         full_response = ""
         for chunk in stream:
+            if cancel_event_for_llm.is_set():
+                logger.info(f"Local LLM (Gemma) generation cancelled for chat_id {chat_id}.")
+                yield CANCEL_MESSAGE
+                # local_llm.close() or similar if the Llama object needs explicit stream closing
+                break # Exit the loop
+
             delta_content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
             if delta_content:
                 yield delta_content
                 full_response += delta_content
         
-        logger.info(f"Gemma full response (simplified): {full_response.strip()}")
+        logger.info(f"Gemma full response (after stream): {full_response.strip()}")
 
     except Exception as e:
-        logger.error(f"Error during local LLM generation (simplified path): {e}", exc_info=True)
+        logger.error(f"Error during local LLM generation: {e}", exc_info=True)
         yield f"Error generating response from local model: {str(e)}"
 
 # --- Flask Routes ---
@@ -1056,18 +1346,11 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
     chat_id = data.get('chat_id')
     model_choice = data.get('model_type', 'gemma') # Default to gemma if not specified
     
-    # --- Configuration for Context History ---
-    MAX_HISTORY_MESSAGES = 10 # Number of recent messages to include in context
-    # ---
-
-    # Create a cancellation event for this request
+    MAX_HISTORY_MESSAGES = 10 
     current_cancel_event = threading.Event()
-    # Ensure chat_id is determined before this line if it can be new
 
     conn = get_db_connection()
     if not conn:
-        # This scenario should ideally be handled more gracefully, 
-        # perhaps with a retry or a clearer error message to the user.
         logger.error("Database connection failed in chat_api at the beginning.")
         return jsonify({"error": "Database connection failed"}), 500
 
@@ -1076,17 +1359,15 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
             chat = conn.execute("SELECT id FROM chats WHERE id = ?", (chat_id,)).fetchone()
             if not chat:
                 logger.info(f"Invalid chat_id {chat_id} provided. Treating as a new chat.")
-                chat_id = None # If chat_id is invalid, treat as a new chat
+                chat_id = None
                 
         if not chat_id:
-            # Create new chat. Consider making title more dynamic or based on first message later.
             new_chat_title = f"Chat {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}" 
             cursor = conn.execute("INSERT INTO chats (title) VALUES (?)", (new_chat_title,))
             conn.commit()
             chat_id = cursor.lastrowid
             logger.info(f"Created new chat with ID: {chat_id}, Title: {new_chat_title}")
 
-        # Store user message
         conn.execute(
             "INSERT INTO messages (chat_id, sender, content) VALUES (?, ?, ?)",
             (chat_id, 'user', user_message_content)
@@ -1094,68 +1375,82 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
         conn.commit()
         logger.info(f"Stored user message for chat_id {chat_id}: '{user_message_content[:50]}...'")
 
-        # Register cancellation event for this chat_id *after* chat_id is confirmed/created
         active_cancellation_events[chat_id] = current_cancel_event
         logger.info(f"Registered cancellation event for chat_id {chat_id}")
 
-        # --- Retrieve and Format Chat History ---
-        full_prompt_for_model = f"User: {user_message_content}" # Default to current message if no history
+        history_context_for_llm = "No previous conversation history for this session."
+        full_prompt_for_model = f"User: {user_message_content}"
         
         if chat_id: 
-            prompt_history_parts = []
-            # Fetch messages prior to the one just inserted for context
-            # We order by timestamp ASC to build the history chronologically
-            query = (
-                "SELECT sender, content FROM messages "
-                "WHERE chat_id = ? AND timestamp < ("
-                "SELECT MAX(timestamp) FROM messages "
-                "WHERE chat_id = ? AND sender = 'user'"
-                ") ORDER BY timestamp ASC LIMIT ?"
-            )
+            actual_history_for_context = []
             history_cursor_for_prompt = conn.execute(
-                query,
-                (chat_id, chat_id, MAX_HISTORY_MESSAGES)
+                "SELECT sender, content FROM messages WHERE chat_id = ? ORDER BY timestamp ASC LIMIT ?",
+                (chat_id, MAX_HISTORY_MESSAGES)
             )
-            fetched_history = history_cursor_for_prompt.fetchall()
+            fetched_history_rows = history_cursor_for_prompt.fetchall()
 
-            if fetched_history:
-                for row in fetched_history:
-                    sender_tag = "User" if row['sender'] == 'user' else "Assistant"
-                    prompt_history_parts.append(f"{sender_tag}: {row['content']}")
-                
-                history_string = "\n".join(prompt_history_parts) # Use literal newline for LLM
-                full_prompt_for_model = f"{history_string}\nUser: {user_message_content}"
+            if fetched_history_rows:
+                history_rows_for_context = fetched_history_rows[:-1]
+                if history_rows_for_context:
+                    for row in history_rows_for_context:
+                        sender_tag = "User" if row['sender'] == 'user' else "Assistant"
+                        actual_history_for_context.append(f"{sender_tag}: {row['content']}")
+                    history_context_for_llm = "\n".join(actual_history_for_context)
             
-            logger.info(f"Constructed prompt for chat_id {chat_id} (history rows: {len(fetched_history)}). Prompt (first 100 chars): {full_prompt_for_model[:100]}...")
-        # --- End Retrieve and Format Chat History ---
+            if actual_history_for_context:
+                full_prompt_for_model = f"{history_context_for_llm}\nUser: {user_message_content}"
+            else:
+                full_prompt_for_model = f"User: {user_message_content}"
+            
+            logger.info(f"Constructed prompt for chat_id {chat_id} (history rows for context: {len(actual_history_for_context)}). Prompt (first 100 chars): {full_prompt_for_model[:100]}...")
 
         response_generator = None
         if model_choice == 'gemma':
             logger.info(f"Using Gemma (local Llama) for chat_id {chat_id} with prompt: '{full_prompt_for_model[:100]}...'")
             response_generator = generate_local_rag_response(full_prompt_for_model, chat_id)
+        elif model_choice == 'wikipedia':
+            logger.info(f"Using Wikipedia + Gemini for chat_id {chat_id}. Original query: '{user_message_content[:100]}...'")
+            wiki_summary = fetch_wikipedia_summary(user_message_content)
+
+            if not wiki_summary or \
+               wiki_summary.startswith("No Wikipedia article found") or \
+               wiki_summary.startswith("Error:"):
+                logger.warning(f"Wikipedia search for '{user_message_content[:50]}...' yielded: {wiki_summary}. Will stream this direct to user.")
+                def direct_response_generator(message):
+                    yield message
+                response_generator = direct_response_generator(wiki_summary or "Sorry, I could not retrieve information from Wikipedia for your query.")
+            else:
+                logger.info(f"Wikipedia summary found for '{user_message_content[:50]}...'. Crafting prompt for Gemini.")
+                gemini_prompt_with_wiki = (
+                    f"You are a helpful AI assistant. You have been provided with a summary from Wikipedia and the user's original query.\n"
+                    f"Please use the Wikipedia summary to construct a comprehensive and well-formatted answer to the user's original query.\n"
+                    f"If conversation history is also provided, use it for additional context.\n\n"
+                    f"Wikipedia Summary:\n---\n{wiki_summary}\n---\n\n"
+                    f"User's Original Query:\n---\n{user_message_content}\n---\n\n"
+                    f"Conversation History (if relevant):\n---\n{history_context_for_llm}\n---\n\n"
+                    f"Please now answer the user's original query based all this information. Provide a direct answer."
+                )
+                logger.info(f"Sending combined Wikipedia/Query to Gemini for chat_id {chat_id}: '{gemini_prompt_with_wiki[:200]}...'" )
+                response_generator = generate_gemini_response(gemini_prompt_with_wiki, chat_id)
         elif model_choice == 'gemini':
-            logger.info(f"Using Gemini API for chat_id {chat_id} with prompt: '{full_prompt_for_model[:100]}...'")
+            logger.info(f"Using Gemini API directly for chat_id {chat_id} with prompt: '{full_prompt_for_model[:100]}...'" )
             response_generator = generate_gemini_response(full_prompt_for_model, chat_id)
         else:
             logger.warning(f"Invalid model choice '{model_choice}' for chat_id {chat_id}")
-            active_cancellation_events.pop(chat_id, None) # Clean up event if returning early
-            return jsonify({"error": "Invalid model choice"}), 400 # Return early
+            active_cancellation_events.pop(chat_id, None)
+            return jsonify({"error": "Invalid model choice"}), 400
 
         if response_generator is None:
             logger.error(f"Response generator was None for model {model_choice}, chat_id {chat_id}")
-            active_cancellation_events.pop(chat_id, None) # Clean up event
-            return jsonify({"error": "Failed to get response from model"}), 500 # Return early
+            active_cancellation_events.pop(chat_id, None)
+            return jsonify({"error": "Failed to get response from model"}), 500
         
         full_bot_response_parts = []
         def stream_and_collect():
             nonlocal full_bot_response_parts
-            # This db_conn_for_stream is crucial because the main `conn` will be closed 
-            # by the time this generator's finally block might execute in some edge cases 
-            # or if the main request handling finishes before the stream does.
             db_conn_for_stream = get_db_connection()
             if not db_conn_for_stream:
                 logger.error(f"Failed to get DB connection for stream_and_collect (chat_id: {chat_id}). Bot response will not be saved.")
-                # Yield an error message or handle as appropriate
                 yield "Error: Could not save conversation history due to a database issue."
                 return
 
@@ -1165,28 +1460,23 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
                     yield chunk 
             except Exception as e_stream:
                 logger.error(f"Error during response streaming for chat_id {chat_id}: {e_stream}", exc_info=True)
-                yield "Error: An error occurred while streaming the response." # Let client know
+                yield "Error: An error occurred while streaming the response."
             finally:
                 logger.info(f"Stream to client finished for chat_id {chat_id}. Attempting to save full bot response to DB.")
                 bot_response_content = "".join(full_bot_response_parts).strip()
                 
-                # Clean up cancellation event for this chat_id
                 removed_event = active_cancellation_events.pop(chat_id, None)
                 if removed_event:
                     logger.info(f"Cleaned up cancellation event for chat_id {chat_id}.")
                 else:
                     logger.warning(f"No cancellation event found to clean up for chat_id {chat_id} during stream_and_collect finally block.")
                 
-                if bot_response_content: # Only save if there's content
+                if bot_response_content:
                     try:
-                        # Store bot message
                         db_conn_for_stream.execute(
                             "INSERT INTO messages (chat_id, sender, content) VALUES (?, ?, ?)",
                             (chat_id, 'bot', bot_response_content)
                         )
-                        
-                        # Update chat's last_snippet and updated_at
-                        # Using the last user message as snippet, or first part of it.
                         snippet = (user_message_content[:70] + "...") if len(user_message_content) > 70 else user_message_content
                         db_conn_for_stream.execute(
                             "UPDATE chats SET last_snippet = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1209,16 +1499,16 @@ def chat_api(): # Renamed from chat to avoid conflict with function name chat
 
     except sqlite3.Error as e_sqlite:
         logger.error(f"Database error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e_sqlite}", exc_info=True)
-        if 'chat_id' in locals() and chat_id is not None: # Ensure chat_id is defined
-            active_cancellation_events.pop(chat_id, None) # Clean up on error
+        if 'chat_id' in locals() and chat_id is not None:
+            active_cancellation_events.pop(chat_id, None)
         return jsonify({"error": "Database operation failed"}), 500
     except Exception as e_main:
         logger.error(f"Unexpected error in /api/chat for chat_id {chat_id if 'chat_id' in locals() else 'unknown'}: {e_main}", exc_info=True)
-        if 'chat_id' in locals() and chat_id is not None: # Ensure chat_id is defined
-            active_cancellation_events.pop(chat_id, None) # Clean up on error
+        if 'chat_id' in locals() and chat_id is not None:
+            active_cancellation_events.pop(chat_id, None)
         return jsonify({"error": "An unexpected server error occurred."}), 500
     finally:
-        if conn: # This is the main connection for the request handling part
+        if conn:
             conn.close()
             logger.debug(f"Closed main DB connection for /api/chat request (chat_id: {chat_id if 'chat_id' in locals() else 'unknown'}).")
 

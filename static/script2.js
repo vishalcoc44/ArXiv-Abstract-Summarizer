@@ -1448,15 +1448,17 @@ document.addEventListener('DOMContentLoaded', () => {
     // Model Selection Button Logic
     const gemmaBtn = document.getElementById('gemma-btn');
     const geminiBtn = document.getElementById('gemini-btn');
+    const wikiBtn = document.getElementById('wiki-btn'); // Added Wiki button
     const themeToggleBtn = document.getElementById('theme-toggle-btn');
     const appLayout = document.querySelector('.app-layout'); // Target for theme class
 
-    if (gemmaBtn && geminiBtn) {
+    if (gemmaBtn && geminiBtn && wikiBtn) { // Added wikiBtn to condition
         gemmaBtn.addEventListener('click', () => {
             if (currentModel !== 'gemma') {
                 currentModel = 'gemma';
                 gemmaBtn.classList.add('active');
                 geminiBtn.classList.remove('active');
+                wikiBtn.classList.remove('active'); // Deactivate wiki
             }
         });
         geminiBtn.addEventListener('click', () => {
@@ -1464,6 +1466,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 currentModel = 'gemini';
                 geminiBtn.classList.add('active');
                 gemmaBtn.classList.remove('active');
+                wikiBtn.classList.remove('active'); // Deactivate wiki
+            }
+        });
+        wikiBtn.addEventListener('click', () => {
+            if (currentModel !== 'wikipedia') {
+                currentModel = 'wikipedia'; // Set model to 'wikipedia'
+                wikiBtn.classList.add('active');
+                gemmaBtn.classList.remove('active');
+                geminiBtn.classList.remove('active');
             }
         });
     }
