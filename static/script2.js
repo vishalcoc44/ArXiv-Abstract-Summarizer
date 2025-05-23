@@ -455,9 +455,45 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (done) {
                         console.log('Stream complete');
                         if(thinkingDots) thinkingDots.style.display = 'none';
-                        // Final update to sidebar after stream is complete
+
+                        // Add copy button for the completed bot message if text was received
+                        if (accumulatedText.trim() !== '' && botMessageWrapper) {
+                            const messageContentDiv = botMessageWrapper.querySelector('.message-content');
+                            if (messageContentDiv && !messageContentDiv.querySelector('.copy-btn')) { // Check if not already added
+                                const copyButton = document.createElement('button');
+                                copyButton.classList.add('icon-btn', 'copy-btn');
+                                copyButton.title = 'Copy message';
+                                copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+                                copyButton.addEventListener('click', () => {
+                                    navigator.clipboard.writeText(accumulatedText) // Use accumulatedText (raw markdown)
+                                        .then(() => {
+                                            copyButton.innerHTML = '<i class="fas fa-check"></i>';
+                                            setTimeout(() => { copyButton.innerHTML = '<i class="fas fa-copy"></i>'; }, 2000);
+                                        })
+                                        .catch(err => {
+                                            console.error('Failed to copy streamed text: ', err);
+                                            // Basic fallback for HTTP or if clipboard API fails
+                                            try {
+                                                const textArea = document.createElement("textarea");
+                                                textArea.value = accumulatedText;
+                                                document.body.appendChild(textArea);
+                                                textArea.focus();
+                                                textArea.select();
+                                                document.execCommand('copy');
+                                                document.body.removeChild(textArea);
+                                                copyButton.innerHTML = '<i class="fas fa-check"></i>';
+                                                setTimeout(() => { copyButton.innerHTML = '<i class="fas fa-copy"></i>'; }, 2000);
+                                            } catch (execErr) {
+                                                console.error('Fallback copy failed for streamed text: ', execErr);
+                                                alert('Failed to copy. Please copy manually.');
+                                            }
+                                        });
+                                });
+                                messageContentDiv.appendChild(copyButton); // Append to message content div
+                            }
+                        }
+
                         fetchAndRenderSidebarData(false);
-                        // Re-enable send button and set icon
                         if (sendButtonIconContainer) {
                             sendButtonIconContainer.innerHTML = '<i class="fas fa-paper-plane"></i>'; 
                         }
@@ -580,6 +616,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function appendMessage(text, type, isThinking = false) {
+        console.log(`[DEBUG] appendMessage called. Type: ${type}, Text Length: ${text.length}, isThinking: ${isThinking}`);
+        if (initialPromptArea && getComputedStyle(initialPromptArea).display !== 'none') {
+            initialPromptArea.style.display = 'none';
+            chatOutput.style.opacity = 1; // Make chat output visible
+        }
+
         const messageWrapper = document.createElement('div');
         messageWrapper.classList.add('message', type);
         messageWrapper.id = `message-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
@@ -589,16 +631,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const avatarIconContainer = document.createElement('div');
         avatarIconContainer.style.width = '32px'; 
         avatarIconContainer.style.height = '32px';
-        // Center icon if needed with CSS on .message-avatar or direct styles here
         avatarIconContainer.style.display = 'flex';
         avatarIconContainer.style.alignItems = 'center';
         avatarIconContainer.style.justifyContent = 'center';
 
         if (type === 'bot-message') {
-            // BOT AVATAR (FontAwesome)
             avatarIconContainer.innerHTML = '<i class="fas fa-robot fa-lg"></i>';
         } else { 
-            // USER AVATAR (FontAwesome)
             avatarIconContainer.innerHTML = '<i class="fas fa-user-astronaut fa-lg"></i>';
         }
         avatar.appendChild(avatarIconContainer);
@@ -610,21 +649,21 @@ document.addEventListener('DOMContentLoaded', () => {
         const messageParagraph = document.createElement('p');
         let animationTimeline = null; 
 
-        if (isThinking && type === 'bot-message') { // For initial placeholder before stream
+        if (isThinking && type === 'bot-message') { 
              const dotsContainer = document.createElement('span');
              dotsContainer.classList.add('thinking-dots');
              dotsContainer.innerHTML = '<span>.</span><span>.</span><span>.</span>';
-             dotsContainer.style.display = 'none'; // Initially hidden, shown by proceedWithSending
+             dotsContainer.style.display = 'none'; 
              messageParagraph.appendChild(dotsContainer);
-        } else if (type === 'bot-message' && !isThinking) { // For non-streamed or post-stream finalization
+        } else if (type === 'bot-message' && !isThinking) { 
             const textToParse = (typeof text === 'string' || text instanceof String) ? text : '';
             let htmlOutput = '';
             try {
                 if (typeof marked === 'undefined') throw new Error('marked is not defined');
                 htmlOutput = marked.parse(textToParse, { sanitize: false, mangle: false });
-            } catch (e) {
+             } catch (e) {
                 htmlOutput = safeMarkdownParse(textToParse);
-            }
+             }
             animationTimeline = animateTextByWord(messageParagraph, htmlOutput);
 
             // Add copy button for bot messages
@@ -633,35 +672,36 @@ document.addEventListener('DOMContentLoaded', () => {
             copyButton.title = 'Copy message';
             copyButton.innerHTML = '<i class="fas fa-copy"></i>';
             copyButton.addEventListener('click', () => {
-                // Fallback for http connections or older browsers
-                const rawText = messageParagraph.innerText || messageParagraph.textContent || '';
-                navigator.clipboard.writeText(rawText).then(() => {
-                    copyButton.innerHTML = '<i class="fas fa-check"></i>';
-                    setTimeout(() => {
-                        copyButton.innerHTML = '<i class="fas fa-copy"></i>';
-                    }, 2000);
-                }).catch(err => {
-                    console.error('Failed to copy text: ', err);
-                    // Basic fallback for HTTP or if clipboard API fails
-                    try {
-                        const textArea = document.createElement("textarea");
-                        textArea.value = rawText;
-                        document.body.appendChild(textArea);
-                        textArea.focus();
-                        textArea.select();
-                        document.execCommand('copy');
-                        document.body.removeChild(textArea);
+                navigator.clipboard.writeText(textToParse) // Use textToParse which is the raw markdown
+                    .then(() => {
                         copyButton.innerHTML = '<i class="fas fa-check"></i>';
                         setTimeout(() => {
                             copyButton.innerHTML = '<i class="fas fa-copy"></i>';
                         }, 2000);
-                    } catch (execErr) {
-                        console.error('Fallback copy failed: ', execErr);
-                        alert('Failed to copy message. Please copy manually.');
-                    }
-                });
+                    })
+                    .catch(err => {
+                        console.error('Failed to copy text: ', err);
+                        // Basic fallback for HTTP or if clipboard API fails
+                        try {
+                            const textArea = document.createElement("textarea");
+                            textArea.value = textToParse;
+                            document.body.appendChild(textArea);
+                            textArea.focus();
+                            textArea.select();
+                            document.execCommand('copy');
+                            document.body.removeChild(textArea);
+                            copyButton.innerHTML = '<i class="fas fa-check"></i>';
+                            setTimeout(() => {
+                                copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+                            }, 2000);
+                        } catch (execErr) {
+                            console.error('Fallback copy failed: ', execErr);
+                            alert('Failed to copy message. Please copy manually.');
+                        }
+                    });
             });
-            messageContentDiv.appendChild(copyButton); // Add it before the paragraph for positioning ease
+            // Prepend copy button to messageContentDiv for better layout control with CSS
+            messageContentDiv.appendChild(copyButton); 
 
         } else if (isThinking && !messageWrapper.classList.contains('bot-thinking-lottie')) { 
             messageParagraph.textContent = text; 
@@ -669,11 +709,45 @@ document.addEventListener('DOMContentLoaded', () => {
                 const dotsContainer = document.createElement('span');
                 dotsContainer.classList.add('thinking-dots');
                 dotsContainer.innerHTML = '<span>.</span><span>.</span><span>.</span>';
-                dotsContainer.style.display = 'none'; // Initially hidden, shown by proceedWithSending
+                dotsContainer.style.display = 'none'; 
                 messageParagraph.appendChild(dotsContainer);
             }
         } else if (type === 'user-message') { 
             messageParagraph.textContent = text; 
+             // Add copy button for user messages
+            const copyButton = document.createElement('button');
+            copyButton.classList.add('icon-btn', 'copy-btn');
+            copyButton.title = 'Copy message';
+            copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+            copyButton.addEventListener('click', () => {
+                navigator.clipboard.writeText(text) // User message text is already plain
+                    .then(() => {
+                        copyButton.innerHTML = '<i class="fas fa-check"></i>';
+                        setTimeout(() => {
+                            copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+                        }, 2000);
+                    })
+                    .catch(err => {
+                        console.error('Failed to copy text for user message: ', err);
+                         try {
+                            const textArea = document.createElement("textarea");
+                            textArea.value = text;
+                            document.body.appendChild(textArea);
+                            textArea.focus();
+                            textArea.select();
+                            document.execCommand('copy');
+                            document.body.removeChild(textArea);
+                            copyButton.innerHTML = '<i class="fas fa-check"></i>';
+                            setTimeout(() => {
+                                copyButton.innerHTML = '<i class="fas fa-copy"></i>';
+                            }, 2000);
+                        } catch (execErr) {
+                            console.error('Fallback copy failed for user message: ', execErr);
+                            alert('Failed to copy message. Please copy manually.');
+                        }
+                    });
+            });
+            messageContentDiv.appendChild(copyButton);
         } else {
             messageParagraph.innerHTML = text; 
         }

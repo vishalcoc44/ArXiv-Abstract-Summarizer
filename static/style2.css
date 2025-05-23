@@ -517,6 +517,8 @@ body {
     padding: 12px 16px;
     border-radius: var(--border-radius-chat-bubble); /* Specific chat bubble radius */
     line-height: 1.5;
+    position: relative; /* This is important for absolute positioning of the copy button */
+    padding-right: 40px; /* Add some padding to prevent text from overlapping with the button */
 }
 
 .message p {
@@ -574,26 +576,30 @@ body {
 
 .copy-btn {
     position: absolute;
-    top: 5px;
-    right: 5px;
-    padding: 4px 6px; /* Smaller padding */
-    font-size: 0.8em; /* Smaller icon */
-    background-color: rgba(255, 255, 255, 0.1); /* Subtle background */
+    top: 8px;
+    right: 8px;
+    background-color: var(--secondary-bg-color);
+    color: var(--text-color);
+    border: 1px solid var(--border-color);
     border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 0.8em;
+    cursor: pointer;
     opacity: 0.6;
-    transition: opacity 0.2s ease, background-color 0.2s ease;
+    transition: opacity 0.2s ease-in-out, background-color 0.2s ease-in-out;
 }
 
-.bot-message .message-content:hover .copy-btn {
+.message:hover .copy-btn {
     opacity: 1;
 }
 
 .copy-btn:hover {
-    background-color: rgba(255, 255, 255, 0.2);
+    background-color: var(--accent-color);
+    color: var(--bg-color);
 }
 
 .copy-btn i {
-    color: var(--text-primary);
+    pointer-events: none; /* Ensure icon doesn't interfere with button click */
 }
 
 /* Thinking dots inside bot message */
