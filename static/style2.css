@@ -547,6 +547,26 @@ body {
     /* border-bottom-left-radius: 4px; REMOVE - use consistent chat bubble radius */
 }
 
+/* Add this for preformatted text within messages (e.g., code blocks from Markdown) */
+.message-content pre {
+    white-space: pre-wrap;   /* Allow wrapping for preformatted text */
+    word-wrap: break-word;   /* For older browser compatibility (alias for overflow-wrap) */
+    overflow-wrap: break-word; /* Standard property for breaking long words/strings */
+    background-color: rgba(0, 0, 0, 0.1); /* Optional: Slight background for code blocks */
+    padding: 8px 12px;        /* Optional: Padding for code blocks */
+    border-radius: 6px;       /* Optional: Rounded corners for code blocks */
+    overflow-x: auto;         /* Optional: Add horizontal scroll if content is still too wide */
+    /* Ensure child code elements also behave if pre isn't the direct parent of long text */
+    /* For example, if marked.js wraps code in <pre><code>...</code></pre> */
+}
+
+.message-content pre code {
+    white-space: inherit; /* Inherit pre-wrap from parent pre */
+    word-wrap: inherit; /* Inherit from parent pre */
+    overflow-wrap: inherit; /* Inherit from parent pre */
+    display: block; /* Ensure code block takes full width available in pre */
+}
+
 /* Copy button for bot messages */
 .bot-message .message-content {
     position: relative; /* For positioning the copy button */
