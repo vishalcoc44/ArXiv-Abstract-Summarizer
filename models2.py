@@ -585,7 +585,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     overall_start_time = time.perf_counter() # Start overall timer
     DEBUG_SKIP_AUGMENTATION = False 
     DEBUG_SKIP_RAG_CONTEXT = False
-    DEBUG_SKIP_GEMINI_SUGGESTIONS = False
+    # DEBUG_SKIP_GEMINI_SUGGESTIONS = False # This flag is no longer relevant here
 
     if not systems_status["local_llm_loaded"] or local_llm is None:
         logger.warning("Local LLM not loaded, yielding error message.")
@@ -613,7 +613,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
 
     # Determine category for FAISS lookup
     category_key_for_faiss = "uncategorized" # Default
-    extracted_subject_for_gemini_hint = None # For Gemini paper suggestions hint
+    extracted_subject_for_gemini_hint = None # Retain for potential other uses, though Gemini suggestions are out for this function
 
     # Attempt to find a matching category from the user query
     # Iterate through the SUBJECT_TO_ARXIV_CATEGORY_PREFIX to find a match
@@ -643,14 +643,30 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     else:
         logger.info(f"No specific category matched in query. Using FAISS category key: '{category_key_for_faiss}'. Query: '{actual_user_question}'")
 
-    subject_filter_for_alignment = extracted_subject_for_gemini_hint # Used for check_category_alignment 
-    num_papers_requested = None
+    # subject_filter_for_alignment = extracted_subject_for_gemini_hint # This was for aligning Gemini suggestions with local data
+    num_papers_requested = None # Default
 
     if is_paper_query:
+        # Try to extract how many papers the user wants
+        # Simple patterns, can be made more sophisticated
+        match_top_n = re.search(r'\\b(top|show|exactly|give me|list|find|recommend)\\s+(\\d+)\\b', query_lower_for_type_check, re.IGNORECASE)
+        if match_top_n:
+            try:
+                num_papers_requested = int(match_top_n.group(2))
+                if not (1 <= num_papers_requested <= 10): 
+                    num_papers_requested = 5 # Default if out of range
+                logger.info(f"Extracted number of papers requested: {num_papers_requested}")
+            except ValueError:
+                num_papers_requested = 5 # Default if parsing fails
+                logger.info(f"Could not parse number of papers, defaulting to {num_papers_requested}")
+        else:
+            num_papers_requested = 5 # Default if no specific number is asked
+            logger.info(f"No specific number of papers requested, defaulting to {num_papers_requested}")
+        
         # The subject_filter_for_alignment is already determined above for the Gemini hint and FAISS key.
         # The original extract_subject_from_query might have slightly different logic, unify if needed.
         # For now, we rely on the category_key_for_faiss and extracted_subject_for_gemini_hint.
-        pass # num_papers_requested logic remains the same
+        # pass # num_papers_requested logic remains the same # This line is now handled above
 
     conversation_history_for_gemma_prompt_list = []
     if len(lines) > 1:
@@ -668,200 +684,127 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     gemma_prompt_build_start_time = time.perf_counter() # General timer for prompt building
 
     if is_paper_query:
-        logger.info("Processing as a paper query with enhanced RAG and synthesis.")
+        logger.info(f"Processing as a paper query. Will search local FAISS in category: '{category_key_for_faiss}'.")
         
-        gemini_arxiv_papers_info = []
-        if not DEBUG_SKIP_GEMINI_SUGGESTIONS and systems_status["gemini_model_configured"]:
-            gemini_call_start_time = time.perf_counter()
-            gemini_arxiv_papers_info = get_gemini_paper_suggestions(
-                actual_user_question,
-                conversation_log_str_for_gemma,
-                chat_id,
-                subject_hint=extracted_subject_for_gemini_hint, # Use the commonly determined subject
-                num_papers_to_suggest=num_papers_requested
-            )
-            gemini_call_duration = time.perf_counter() - gemini_call_start_time
-            logger.info(f"[PERF] Gemini paper suggestions call took: {gemini_call_duration:.4f} seconds.")
-        elif DEBUG_SKIP_GEMINI_SUGGESTIONS:
-            logger.info("DEBUG_SKIP_GEMINI_SUGGESTIONS is true. Skipping Gemini ArXiv paper suggestions.")
+        # --- This entire block for Gemini suggestions is removed ---
+        # gemini_arxiv_papers_info = []
+        # if not DEBUG_SKIP_GEMINI_SUGGESTIONS and systems_status["gemini_model_configured"]:
+        #    ... (Gemini call and processing) ...
+        # if gemini_arxiv_papers_info:
+        #    ... (Looping through Gemini suggestions and trying to match in FAISS) ...
+        # papers_for_gemma_synthesis.append(paper_data_for_gemma) 
+        # --- End of removed Gemini block ---
 
-        if gemini_arxiv_papers_info:
-            logger.info(f"Received {len(gemini_arxiv_papers_info)} paper suggestions from Gemini for processing.")
-            faiss_processing_total_time = 0
-            for idx, gemini_suggestion in enumerate(gemini_arxiv_papers_info):
-                faiss_iteration_start_time = time.perf_counter()
-                title = gemini_suggestion.get("title", "N/A Title").strip()
-                authors_raw = gemini_suggestion.get("authors")
-                arxiv_id = gemini_suggestion.get("arxiv_id", "").strip()
-                gemini_abstract = gemini_suggestion.get("abstract", "").strip()
-                max_len_for_emb = 1000 # Consistent with are_texts_semantically_similar
-
-                paper_data_for_gemma = {
-                    "title": title, "authors": [], "arxiv_id": arxiv_id,
-                    "gemini_abstract": gemini_abstract, "local_abstract": None,
-                    "chosen_abstract": gemini_abstract, 
-                    "abstract_source": "Gemini (no local match found or preferred)"
-                }
-                if isinstance(authors_raw, list): paper_data_for_gemma["authors"] = [str(a).strip() for a in authors_raw if str(a).strip()]
-                elif isinstance(authors_raw, str): paper_data_for_gemma["authors"] = [a.strip() for a in authors_raw.split(',') if a.strip()]
-
-                # Use the determined category_key_for_faiss for loading the index
-                # If is_paper_query is true, we prefer the category determined from the query for targeted search.
-                # If a paper from Gemini has a very different category, this could be an issue, but
-                # Gemini is hinted with extracted_subject_for_gemini_hint, so they should align generally.
-                current_faiss_index_to_use = load_category_faiss_index(category_key_for_faiss)
-
-                if current_faiss_index_to_use and not DEBUG_SKIP_RAG_CONTEXT:
-                    search_query_for_faiss = title
-                    if arxiv_id: search_query_for_faiss += f" arxiv:{arxiv_id}"
-                    
-                    best_local_match_info = None
-                    faiss_search_call_start_time = time.perf_counter()
-                    try:
-                        docs_with_scores = current_faiss_index_to_use.similarity_search_with_score(search_query_for_faiss, k=10)
-                        faiss_search_call_duration = time.perf_counter() - faiss_search_call_start_time
-                        logger.info(f"[PERF] FAISS search for '{title}' (k=10) in category '{category_key_for_faiss}' took: {faiss_search_call_duration:.4f} seconds.")
-                        
-                        semantic_sim_total_time_iter = 0
-                        gemini_title_embedding = None
-                        candidate_title_embeddings = []
-
-                        if docs_with_scores and embeddings_model: # Prepare embeddings if we have docs and model
-                            try:
-                                gemini_title_embedding = np.array(embeddings_model.embed_query(title[:max_len_for_emb]))
-                                
-                                candidate_titles_for_embedding = [
-                                    doc.metadata.get("title", "").strip()[:max_len_for_emb] 
-                                    for doc, _ in docs_with_scores
-                                ]
-                                if candidate_titles_for_embedding:
-                                    batched_embeddings = embeddings_model.embed_documents(candidate_titles_for_embedding)
-                                    candidate_title_embeddings = [np.array(emb) for emb in batched_embeddings]
-                                else: # Should not happen if docs_with_scores is not empty
-                                    candidate_title_embeddings = []
-
-                            except Exception as e_embed:
-                                logger.error(f"Error pre-computing embeddings for title '{title}': {e_embed}", exc_info=True)
-                                # Continue without semantic checks if embeddings fail
-                                gemini_title_embedding = None 
-                                candidate_title_embeddings = []
-                        
-                        if docs_with_scores:
-                            # Check 1: ID match + Category alignment (Priority)
-                            for doc_candidate, score in docs_with_scores:
-                                local_arxiv_id_match_val = doc_candidate.metadata.get("arxiv_id", "").strip()
-                                if arxiv_id and local_arxiv_id_match_val and arxiv_id.lower() == local_arxiv_id_match_val.lower():
-                                    local_categories = doc_candidate.metadata.get("categories")
-                                    if isinstance(local_categories, str): local_categories = [c.strip() for c in local_categories.split(',')]
-                                    is_aligned = check_category_alignment(local_categories, subject_filter_for_alignment)
-                                    if is_aligned:
-                                        local_abstract_text = doc_candidate.metadata.get("abstract")
-                                        if local_abstract_text:
-                                            best_local_match_info = {"abstract_text": local_abstract_text, "source": "Local FAISS (ID Match, Category Aligned)"}
-                                            logger.info(f"Local FAISS strong match for '{title}' (ID & Category). Source: {best_local_match_info['source']}")
-                                            break 
-                            
-                            # Check 2: Title similarity + Category alignment
-                            if not best_local_match_info:
-                                for idx_cand, (doc_candidate, score) in enumerate(docs_with_scores):
-                                    candidate_title = doc_candidate.metadata.get("title", "").strip()
-                                    title_similar_enough = score < 0.6 
-                                    if title_similar_enough:
-                                        is_sem_similar = False
-                                        if gemini_title_embedding is not None and idx_cand < len(candidate_title_embeddings):
-                                            semantic_sim_start_time = time.perf_counter()
-                                            similarity_score = calculate_vector_cosine_similarity(gemini_title_embedding, candidate_title_embeddings[idx_cand])
-                                            is_sem_similar = similarity_score >= 0.75
-                                            semantic_sim_duration = time.perf_counter() - semantic_sim_start_time
-                                            semantic_sim_total_time_iter += semantic_sim_duration
-                                            logger.debug(f"[PERF] Calculated semantic similarity ({similarity_score:.4f}) for '{title}' vs '{candidate_title}' took: {semantic_sim_duration:.4f}s")
-                                        else:
-                                            # Fallback or log error if embeddings not available
-                                            logger.warning(f"Skipping semantic check for '{title}' vs '{candidate_title}' due to missing embeddings.")
-
-                                        if is_sem_similar:
-                                            local_categories = doc_candidate.metadata.get("categories")
-                                            if isinstance(local_categories, str): local_categories = [c.strip() for c in local_categories.split(',')]
-                                            is_aligned = check_category_alignment(local_categories, subject_filter_for_alignment)
-                                            if is_aligned:
-                                                local_abstract_text = doc_candidate.metadata.get("abstract")
-                                                if local_abstract_text:
-                                                    best_local_match_info = {"abstract_text": local_abstract_text, "source": "Local FAISS (Title Match, Category Aligned)"}
-                                                    logger.info(f"Local FAISS good match for '{title}' (Title & Category). Source: {best_local_match_info['source']}")
-                                                    break # Found a good aligned title match
-
-                            # Check 3: ID match (Category Not Aligned/No Filter) - Fallback
-                            if not best_local_match_info:
-                                for doc_candidate, score in docs_with_scores:
-                                    local_arxiv_id_match_val = doc_candidate.metadata.get("arxiv_id", "").strip()
-                                    if arxiv_id and local_arxiv_id_match_val and arxiv_id.lower() == local_arxiv_id_match_val.lower():
-                                        local_abstract_text = doc_candidate.metadata.get("abstract")
-                                        if local_abstract_text:
-                                            best_local_match_info = {"abstract_text": local_abstract_text, "source": "Local FAISS (ID Match, Category N/A)"}
-                                            logger.info(f"Local FAISS match for '{title}' (ID, Category N/A). Source: {best_local_match_info['source']}")
-                                            break
-
-                            # Check 4: Title similarity (Category Not Aligned/No Filter) - Last Resort Fallback
-                            if not best_local_match_info:
-                                for idx_cand, (doc_candidate, score) in enumerate(docs_with_scores):
-                                    candidate_title = doc_candidate.metadata.get("title", "").strip()
-                                    title_similar_enough_fallback = score < 0.5 
-                                    if title_similar_enough_fallback:
-                                        is_sem_similar_fallback = False
-                                        if gemini_title_embedding is not None and idx_cand < len(candidate_title_embeddings):
-                                            semantic_sim_start_time = time.perf_counter()
-                                            similarity_score_fallback = calculate_vector_cosine_similarity(gemini_title_embedding, candidate_title_embeddings[idx_cand])
-                                            is_sem_similar_fallback = similarity_score_fallback >= 0.80
-                                            semantic_sim_duration = time.perf_counter() - semantic_sim_start_time
-                                            semantic_sim_total_time_iter += semantic_sim_duration
-                                            logger.debug(f"[PERF] Calculated fallback semantic similarity ({similarity_score_fallback:.4f}) for '{title}' vs '{candidate_title}' took: {semantic_sim_duration:.4f}s")
-                                        else:
-                                            logger.warning(f"Skipping fallback semantic check for '{title}' vs '{candidate_title}' due to missing embeddings.")
-
-                                        if is_sem_similar_fallback:
-                                            local_abstract_text = doc_candidate.metadata.get("abstract")
-                                            if local_abstract_text:
-                                                best_local_match_info = {"abstract_text": local_abstract_text, "source": "Local FAISS (Title Match, Category N/A)"}
-                                                logger.info(f"Local FAISS fallback match for '{title}' (Title, Category N/A). Source: {best_local_match_info['source']}")
-                                                break # Taking the first decent title match if all else fails
-                        
-                        logger.info(f"[PERF] Total semantic similarity check time for FAISS iteration '{title}': {semantic_sim_total_time_iter:.4f}s")
-
-                        if best_local_match_info:
-                            paper_data_for_gemma["local_abstract"] = best_local_match_info["abstract_text"]
-                            paper_data_for_gemma["chosen_abstract"] = best_local_match_info["abstract_text"]
-                            paper_data_for_gemma["abstract_source"] = best_local_match_info["source"]
-                        else:
-                            logger.info(f"No suitable local FAISS match found for '{title}' after evaluating top 10 from category '{category_key_for_faiss}'. Using Gemini abstract.")
-                    except Exception as e_targeted_faiss:
-                        logger.error(f"Error during targeted FAISS search for suggestion '{title}' in category '{category_key_for_faiss}': {e_targeted_faiss}", exc_info=True)
-                elif not current_faiss_index_to_use:
-                    logger.warning(f"FAISS index for category '{category_key_for_faiss}' could not be loaded. Skipping local FAISS lookup for Gemini suggestion '{title}'.")
-                elif DEBUG_SKIP_RAG_CONTEXT:
-                    logger.info("DEBUG_SKIP_RAG_CONTEXT is true. Skipping targeted FAISS search.")
+        # New: Directly search local FAISS for relevant papers
+        retrieved_context_docs_for_papers = []
+        if not DEBUG_SKIP_RAG_CONTEXT and systems_status["faiss_base_path_exists"]:
+            current_faiss_index_to_use = load_category_faiss_index(category_key_for_faiss)
+            if current_faiss_index_to_use:
+                # Determine how many docs to retrieve. More than requested to give LLM a choice.
+                k_for_faiss_search = (num_papers_requested * 2) + 5 # e.g., if 5 requested, get 15
+                k_for_faiss_search = min(max(k_for_faiss_search, 10), 25) # Ensure it's between 10 and 25
                 
-                papers_for_gemma_synthesis.append(paper_data_for_gemma)
-                faiss_iteration_duration = time.perf_counter() - faiss_iteration_start_time
-                faiss_processing_total_time += faiss_iteration_duration
-                logger.info(f"[PERF] FAISS processing for Gemini suggestion '{title}' took: {faiss_iteration_duration:.4f} seconds.")
-            logger.info(f"[PERF] Total FAISS processing time for all Gemini suggestions: {faiss_processing_total_time:.4f} seconds.")
+                logger.info(f"Searching FAISS category '{category_key_for_faiss}' for '{actual_user_question}' with k={k_for_faiss_search}")
+                rag_faiss_search_start_time = time.perf_counter()
+                try:
+                    docs_with_scores = current_faiss_index_to_use.similarity_search_with_score(
+                        actual_user_question, 
+                        k=k_for_faiss_search
+                    )
+                    rag_faiss_search_duration = time.perf_counter() - rag_faiss_search_start_time
+                    logger.info(f"[PERF] Local FAISS paper search (k={k_for_faiss_search}) in category '{category_key_for_faiss}' took: {rag_faiss_search_duration:.4f} seconds.")
+
+                    if docs_with_scores:
+                        # Filter by score if needed, or take top N directly
+                        # For now, let's take all retrieved up to k_for_faiss_search for LLM to process
+                        # relevant_docs = [doc for doc, score in docs_with_scores if score < 0.85] # Example score filter
+                        retrieved_context_docs_for_papers = [doc for doc, score in docs_with_scores] # Taking all
+                        logger.info(f"Retrieved {len(retrieved_context_docs_for_papers)} documents from FAISS for paper query.")
+                    else:
+                        logger.info(f"No documents returned from FAISS search for paper query in category '{category_key_for_faiss}'.")
+                except Exception as e_local_faiss_paper_search:
+                    logger.error(f"Error during local FAISS paper search in category '{category_key_for_faiss}': {e_local_faiss_paper_search}", exc_info=True)
+            else:
+                logger.warning(f"FAISS index for category '{category_key_for_faiss}' could not be loaded for paper query.")
+        elif DEBUG_SKIP_RAG_CONTEXT:
+            logger.info("DEBUG_SKIP_RAG_CONTEXT is true. Skipping FAISS search for paper query.")
         
+        # Populate papers_for_gemma_synthesis directly from FAISS results
+        if retrieved_context_docs_for_papers:
+            for doc in retrieved_context_docs_for_papers:
+                # Extract metadata. Ensure keys exist or provide defaults.
+                title = doc.metadata.get("title", "N/A Title").strip()
+                authors_list = doc.metadata.get("authors", [])
+                if isinstance(authors_list, str): # If authors is a string, try to split
+                    authors = [a.strip() for a in authors_list.split(',') if a.strip()]
+                elif isinstance(authors_list, list):
+                    authors = [str(a).strip() for a in authors_list if str(a).strip()]
+                else:
+                    authors = ["N/A"]
+
+                arxiv_id = doc.metadata.get("arxiv_id", "N/A").strip()
+                local_abstract = doc.metadata.get("abstract", doc.page_content if doc.page_content else "N/A").strip()
+
+                papers_for_gemma_synthesis.append({
+                    "title": title,
+                    "authors": authors,
+                    "arxiv_id": arxiv_id,
+                    "chosen_abstract": local_abstract, # Using local abstract directly
+                    "abstract_source": f"Local FAISS ({category_key_for_faiss})"
+                })
+            logger.info(f"Prepared {len(papers_for_gemma_synthesis)} papers from local FAISS for Gemma synthesis.")
+
         if papers_for_gemma_synthesis:
-            parts = ["<start_of_turn>user\\\nYou are an AI research assistant. Analyze papers relative to user query.\\nUSER'S QUERY:\\n---\\n" + actual_user_question + "\\n---\\nPAPERS (Title, Authors, ArXiv ID, Abstract):\\n===\\"]
-            for i, p in enumerate(papers_for_gemma_synthesis):
-                parts.append(f"Paper {i+1}: {p['title']}\\\nAuthors: {(', '.join(p['authors']) if p['authors'] else 'N/A')}\\\nArXiv ID: {(p['arxiv_id'] if p['arxiv_id'] else 'N/A')}\\\nAbstract:\\n{p.get('chosen_abstract', 'N/A')}\\\n---")
-            parts.append("End of Paper Details.\\nRequired output for EACH paper: 1. Paper [Number]: [Title]. 2. Authors: [Names]. 3. ArXiv ID: [ID]. 4. YOUR 2-4 sentence summary of GIVEN ABSTRACT relating to USER QUERY. Do NOT repeat abstract. State if irrelevant. NO source info.\\nBegin with Paper 1.\\n<end_of_turn>\\\n<start_of_turn>model\\\nAnalysis:")
-            prompt_for_gemma = "".join(parts)
-            generation_params = {"temperature": AppConfig.LLAMA_TEMPERATURE, "top_p": AppConfig.LLAMA_TOP_P, "max_tokens": AppConfig.LLAMA_MAX_TOKENS}
-            logger.info(f"Using paper query params: {generation_params}")
-        # If no papers from Gemini, this block is skipped, and it falls to general RAG or direct response.
-            
+            # Construct prompt for Gemma to select and summarize N papers from the retrieved set
+            context_papers_str_parts = []
+            for i, p_data in enumerate(papers_for_gemma_synthesis):
+                context_papers_str_parts.append(
+                    f"Document {i+1} (Potential Paper):\n"
+                    f"Title: {p_data['title']}\n"
+                    f"Authors: {', '.join(p_data['authors']) if p_data['authors'] else 'N/A'}\n"
+                    f"ArXiv ID: {p_data['arxiv_id'] if p_data['arxiv_id'] else 'N/A'}\n"
+                    f"Abstract:\n{p_data['chosen_abstract']}\n---"
+                )
+            context_str = "\\n".join(context_papers_str_parts)
+
+            prompt_instruction = (
+                f"You are an AI research assistant. Based on the user's query and the following retrieved academic document summaries from our local ArXiv database, "
+                f"please identify and present up to {num_papers_requested} of the most relevant papers. "
+                f"For each selected paper, provide its Title, Authors, ArXiv ID, and a concise 2-4 sentence summary derived from its provided abstract, highlighting its relevance to the user's query. "
+                f"If fewer than {num_papers_requested} relevant papers are found in the provided context, list only those that are relevant. "
+                f"If no relevant papers are found in the context, state that. Do not make up papers or information not present in the provided document summaries."
+            )
+
+            parts = [
+                f"{conversation_log_str_for_gemma}",
+                f"<start_of_turn>user",
+                f"{prompt_instruction}",
+                f"\\nUSER'S QUERY:\\n---\\n{actual_user_question}\\n---",
+                f"\\nCONTEXT DOCUMENT SUMMARIES:\\n===\\n{context_str}\\n===",
+                f"Please begin your response now, presenting the papers as requested.",
+                f"<end_of_turn>",
+                f"<start_of_turn>model",
+                f"Okay, I will analyze the provided document summaries and select up to {num_papers_requested} relevant papers for your query: '{actual_user_question}'." 
+                # The model should then list them out.
+            ]
+            prompt_for_gemma = "\\n".join(parts)
+            generation_params = {"temperature": AppConfig.LLAMA_TEMPERATURE, "top_p": AppConfig.LLAMA_TOP_P, "max_tokens": AppConfig.LLAMA_MAX_TOKENS} # Potentially allow more tokens for summarization
+            logger.info(f"Using paper query params (local FAISS only): {generation_params}")
+            logger.debug(f"Gemma prompt for local paper synthesis (first 500 chars): {prompt_for_gemma[:500]}...")
+        else: # No papers retrieved from FAISS or DEBUG_SKIP_RAG_CONTEXT
+            logger.info(f"No papers retrieved from FAISS for category '{category_key_for_faiss}' to synthesize for the paper query. Proceeding to general RAG or direct response.")
+            # This will naturally fall through to the next 'if not papers_for_gemma_synthesis ...' block
+            # which handles general RAG or direct response.
+            # We set prompt_for_gemma to empty here to ensure it falls through if is_paper_query was true but no papers found.
+            prompt_for_gemma = ""
+
+
     # General RAG or fallback if paper query yielded no specific papers to synthesize (and not DEBUG_SKIP_AUGMENTATION)
-    if not papers_for_gemma_synthesis and not DEBUG_SKIP_AUGMENTATION: # This condition ensures we only enter here if paper synthesis didn't happen.
-        logger.info("Proceeding with general RAG / direct response flow.")
+    # This block will also be hit if is_paper_query was true but papers_for_gemma_synthesis remained empty.
+    if not prompt_for_gemma and not DEBUG_SKIP_AUGMENTATION: # Check if prompt_for_gemma was set by paper query block
+        logger.info("Proceeding with general RAG / direct response flow (either not a paper query, or paper query found no local docs).")
         context_docs = []
         
-        # Determine category for general RAG (could be same as paper query or different if no paper query)
         # The category_key_for_faiss is already determined based on the user query earlier.
         current_faiss_index_to_use_general_rag = load_category_faiss_index(category_key_for_faiss)
 
