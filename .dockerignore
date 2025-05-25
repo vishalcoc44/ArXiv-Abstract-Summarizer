@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+env/
+venv/
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Large model files and FAISS index
+gemma-3-4b-it-q4_0.gguf
+gemma_1b_finetuned_q4_0.gguf
+gemma_1b_finetuned_f16_v2.gguf
+langchain_faiss_store_optimized1/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+chat_app.db
+
+# Other potentially large or unnecessary files/dirs
+arxiv_abstracts/
+arxiv_papers/
+logs_local_gemma/
+Research Papers/
+merged_gemma_1b_finetuned_hf/
+fine_tuned_model_gemma_colab_3_1b/
+llama.cpp/ 

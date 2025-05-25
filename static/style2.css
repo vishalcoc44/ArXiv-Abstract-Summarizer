@@ -24,6 +24,7 @@
     --bg-primary: #f0f2f5;       /* Light grey - main background */
     --bg-secondary: #ffffff;     /* White - sidebar, cards */
     --bg-tertiary: #e9ecef;      /* Lighter grey - input fields, hover */
+    --main-content-bg-light: #FAFAFA; /* Slightly off-white for main content in light mode */
     /* --bg-accent is kept from :root by default, can be overridden if needed for light bg */
     /* --bg-accent: #0d8a67; */ 
     --text-primary: #181c20;     /* Dark grey/black - main text */
@@ -91,6 +92,26 @@ body {
     align-items: center;
     gap: 8px; /* Adjust gap between buttons as needed */
 }
+
+/* Style for the clear all chats button, similar to other icon buttons */
+#clear-all-chats-btn i.fa-trash-alt {
+    /* Icon specific styling if needed, e.g., color */
+    color: var(--text-secondary); /* Default color */
+}
+
+#clear-all-chats-btn:hover i.fa-trash-alt {
+    color: var(--text-primary); /* Color on hover */
+}
+
+/* Optional: Add a more dangerous hover effect, e.g., red icon */
+/*
+#clear-all-chats-btn:hover i.fa-trash-alt {
+    color: #ff4d4d; 
+}
+#clear-all-chats-btn:hover {
+    background-color: rgba(255, 77, 77, 0.1); 
+}
+*/
 
 .app-logo-title {
     display: flex;
@@ -314,7 +335,7 @@ body {
     flex-grow: 1;
     display: flex;
     flex-direction: column;
-    background-color: var(--bg-secondary); /* Main chat area background */
+    background-color: #1E1F21; /* Slightly darker than --bg-primary for chat area */
     overflow: hidden; /* Important for managing chat scroll */
 }
 
@@ -1378,4 +1399,8 @@ h1 .char { /* from previous example, might be reused or adapted */
 
 .light-mode .copy-btn:hover {
     background-color: rgba(0, 0, 0, 0.08); /* Darker subtle hover for light mode */
+}
+
+.light-mode .main-content {
+    background-color: var(--main-content-bg-light); /* Use the new variable for light mode */
 } 

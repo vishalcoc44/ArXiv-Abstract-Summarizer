@@ -15,3 +15,5 @@ triton # For PyTorch inductor
 safetensors # For faster model loading
 xformers # For memory efficient attention if using GPU
 optimum # Hugging Face's optimization toolkit
+gunicorn
+google-cloud-storage

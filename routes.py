@@ -378,6 +378,32 @@ def cancel_stream(chat_id):
         logger.warning(f"No active stream found to cancel for chat_id: {chat_id}")
         return jsonify({"message": f"No active stream found for chat_id {chat_id} to cancel."}), 404
 
+@app.route('/api/chats/clear-all', methods=['DELETE'])
+def clear_all_chats():
+    conn = get_db_connection()
+    try:
+        # First delete all messages from all chats
+        conn.execute("DELETE FROM messages")
+        logger.info("Deleted all messages from all chats.")
+
+        # Then delete all chats
+        conn.execute("DELETE FROM chats")
+        logger.info("Deleted all chats.")
+        
+        # Optionally, also delete all folders if that's desired
+        # conn.execute("DELETE FROM folders")
+        # logger.info("Deleted all folders.")
+
+        conn.commit()
+        return jsonify({"message": "All chats, associated messages have been cleared."}), 200
+    except sqlite3.Error as e:
+        logger.error(f"Error clearing all chats and messages: {e}", exc_info=True)
+        conn.rollback() # Rollback in case of error
+        return jsonify({"error": "Failed to clear all chats"}), 500
+    finally:
+        if conn:
+            conn.close()
+
 @app.route('/api/folders/<int:folder_id>', methods=['DELETE'])
 def delete_folder(folder_id):
     conn = get_db_connection()

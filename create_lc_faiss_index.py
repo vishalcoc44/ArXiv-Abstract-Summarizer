@@ -10,23 +10,30 @@ import logging
 import uuid # For generating unique docstore IDs
 import torch # Import torch to check for GPU
 import time # For ETR calculation
+from collections import defaultdict # For easier handling of per-category data
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-# Read files from a local folder named "arxiv_abstracts"
-ABSTRACT_DIR = "arxiv_abstracts"  # Directory where the input files are located locally
+ABSTRACT_DIR = "/kaggle/input/embeddings"  # Directory where the input files are located locally
 DOCS_METADATA_PATH = os.path.join(ABSTRACT_DIR, "abstract_metadata.pkl")
 EMBEDDINGS_NUMPY_PATH = os.path.join(ABSTRACT_DIR, "abstract_embeddings.npy")
-OUTPUT_FAISS_DIR = "langchain_faiss_store_optimized"  # Output directory, can be local too
+OUTPUT_FAISS_DIR = "/kaggle/working/langchain_faiss_store_optimized"  # Output directory, can be local too
+
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 # --- Optimization Configuration (re-added from old script) ---
 DOCSTORE_ADD_BATCH_SIZE = 100_000  # Adjust based on memory and dataset size
 PROGRESS_LOG_INTERVAL = 100_000 # For ETR updates. Can be same as batch size or different.
+
+# --- KNOWN MAIN CATEGORIES (from models.py) ---
+KNOWN_MAIN_CATEGORIES = [
+    "math", "cs", "physics", "astro-ph", "cond-mat",
+    "stat", "q-bio", "q-fin", "nlin", "gr-qc", "hep-th", "quant-ph"
+]
 
 # Helper function to format seconds into HH:MM:SS (re-added from old script)
 def format_time(seconds):
@@ -36,6 +43,43 @@ def format_time(seconds):
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+# Function to get categories from a document dictionary
+def get_doc_categories(doc_dict):
+    """
+    Extracts raw categories from doc_dict, maps them to KNOWN_MAIN_CATEGORIES,
+    and returns a list of unique main categories for indexing.
+    If no mapping is found, returns ["uncategorized"].
+    """
+    raw_categories_input = doc_dict.get('categories', [])
+    processed_raw_categories = []
+
+    if isinstance(raw_categories_input, str):
+        # Handle comma-separated string or single string
+        if ',' in raw_categories_input:
+            processed_raw_categories = [cat.strip() for cat in raw_categories_input.split(',') if cat.strip()]
+        else:
+            processed_raw_categories = [raw_categories_input.strip()] if raw_categories_input.strip() else []
+    elif isinstance(raw_categories_input, list):
+        # Handle list of categories
+        processed_raw_categories = [str(cat).strip() for cat in raw_categories_input if str(cat).strip()]
+
+    if not processed_raw_categories:
+        return ["uncategorized"] # Default if no categories found in doc at all
+
+    mapped_main_categories = set()
+    for raw_cat in processed_raw_categories:
+        # Extract the main part (e.g., "cs.AI" -> "cs", "hep-th" -> "hep-th")
+        main_part = raw_cat.split('.')[0]
+        if main_part in KNOWN_MAIN_CATEGORIES:
+            mapped_main_categories.add(main_part)
+    
+    if not mapped_main_categories:
+        # If raw categories existed but none mapped to KNOWN_MAIN_CATEGORIES
+        return ["uncategorized"]
+    
+    return list(mapped_main_categories)
+
 
 # Function to create comprehensive text content from multiple fields (from new script)
 def create_comprehensive_text_content(doc_dict):
@@ -88,8 +132,8 @@ def create_comprehensive_text_content(doc_dict):
     return comprehensive_text
 
 def main():
-    logger.info("Starting Optimized LangChain FAISS index creation process (with GPU attempt)...")
-    print("\n--- Script Start ---")
+    logger.info("Starting Optimized LangChain FAISS index creation process (with GPU attempt) - CATEGORIZED OUTPUT...")
+    print("\n--- Script Start (Categorized Output) ---")
 
     if not os.path.exists(ABSTRACT_DIR):
         print(f"!!! ERROR: Input directory not found: {ABSTRACT_DIR}.")
@@ -104,6 +148,17 @@ def main():
 
     print(f"--- Input directory and files found: {ABSTRACT_DIR} ---")
     logger.info("Input directory and files verified. Proceeding...")
+
+    # Create output directory if it doesn't exist
+    if not os.path.exists(OUTPUT_FAISS_DIR):
+        try:
+            os.makedirs(OUTPUT_FAISS_DIR)
+            logger.info(f"Created base output directory: {OUTPUT_FAISS_DIR}")
+            print(f"--- Created base output directory: {OUTPUT_FAISS_DIR} ---")
+        except OSError as e:
+            logger.error(f"Could not create base output directory {OUTPUT_FAISS_DIR}: {e}. Aborting.")
+            print(f"!!! ERROR: Could not create base output directory {OUTPUT_FAISS_DIR}: {e}. Aborting.")
+            return
 
     try:
         print("--- Entering main processing try block ---")
@@ -136,194 +191,235 @@ def main():
 
         logger.info(f"Loading pre-computed embeddings from: {EMBEDDINGS_NUMPY_PATH}")
         print(f"--- Loading embeddings from: {EMBEDDINGS_NUMPY_PATH} ---")
-        numpy_embeddings = np.load(EMBEDDINGS_NUMPY_PATH).astype('float32')
-        logger.info(f"Loaded embeddings with shape {numpy_embeddings.shape}.")
-        print(f"--- Loaded embeddings with shape {numpy_embeddings.shape} ---")
+        all_numpy_embeddings = np.load(EMBEDDINGS_NUMPY_PATH).astype('float32')
+        logger.info(f"Loaded embeddings with shape {all_numpy_embeddings.shape}.")
+        print(f"--- Loaded embeddings with shape {all_numpy_embeddings.shape} ---")
 
-        if len(docs_data_list) != len(numpy_embeddings):
-            print(f"!!! ERROR: Mismatch between number of documents ({len(docs_data_list)}) and embeddings ({len(numpy_embeddings)}). Aborting.")
-            logger.error(f"Mismatch between docs ({len(docs_data_list)}) and embeddings ({len(numpy_embeddings)}). Aborting.")
+        if len(docs_data_list) != len(all_numpy_embeddings):
+            print(f"!!! ERROR: Mismatch between number of documents ({len(docs_data_list)}) and embeddings ({len(all_numpy_embeddings)}). Aborting.")
+            logger.error(f"Mismatch between docs ({len(docs_data_list)}) and embeddings ({len(all_numpy_embeddings)}). Aborting.")
             return
 
-        # 1. Build the raw FAISS index
-        dimension = numpy_embeddings.shape[1]
-        logger.info(f"Attempting to build raw FAISS index (dimension {dimension}) on device: {device}...")
-        print(f"--- Building raw FAISS index (dimension {dimension}) on device: {device} ---")
-        
-        raw_faiss_index = None
-        faiss_res = None # Initialize faiss_res
-        if device == "cuda":
-            try:
-                logger.info("Attempting to use FAISS GPU resources.")
-                print("--- Attempting to use FAISS GPU resources ---")
-                faiss_res = faiss.StandardGpuResources()
-                raw_faiss_index = faiss.IndexFlatL2Gpu(faiss_res, dimension, 0) # 0 is GPU ID
-                logger.info("FAISS Index built successfully on GPU.")
-                print("--- FAISS Index built successfully on GPU ---")
-            except Exception as gpu_e:
-                print(f"!!! WARNING: Could not build FAISS index on GPU: {gpu_e}. Falling back to CPU.")
-                logger.warning(f"Could not build FAISS index on GPU: {gpu_e}. Falling back to CPU.")
-                raw_faiss_index = faiss.IndexFlatL2(dimension)
-                faiss_res = None # Ensure faiss_res is None if GPU failed
-                print("--- Falling back to CPU FAISS IndexFlatL2 ---")
-        else:
-            logger.info("No CUDA device. Building FAISS IndexFlatL2 on CPU.")
-            print("--- Building FAISS IndexFlatL2 on CPU ---")
-            raw_faiss_index = faiss.IndexFlatL2(dimension)
+        dimension = all_numpy_embeddings.shape[1]
 
-        if raw_faiss_index is None:
-              print("!!! ERROR: Failed to create FAISS index. Aborting.")
-              logger.error("Failed to create FAISS index. Aborting.")
-              return
+        # --- Data structures for per-category indexing ---
+        docstores_by_category = defaultdict(InMemoryDocstore)
+        embeddings_by_category = defaultdict(list)
+        index_to_docstore_id_by_category = defaultdict(dict)
+        doc_batches_by_category = defaultdict(dict) # For batching docstore adds per category
+        # For FAISS, indices within a category-specific index will be 0-based
+        # So we need a way to map this local FAISS index to the global doc_id
+        # The index_to_docstore_id_by_category will store {faiss_idx_in_category_index: doc_id}
 
-        logger.info(f"Adding {len(numpy_embeddings)} embeddings to the raw FAISS index...")
-        print(f"--- Adding {len(numpy_embeddings)} embeddings to the raw FAISS index (this may take time)... ---")
-        add_embeddings_start_time = time.time()
-        raw_faiss_index.add(numpy_embeddings)
-        add_embeddings_duration = time.time() - add_embeddings_start_time
-        logger.info(f"Raw FAISS index built with {raw_faiss_index.ntotal} embeddings in {format_time(add_embeddings_duration)}.")
-        print(f"--- Raw FAISS index built with {raw_faiss_index.ntotal} embeddings in {format_time(add_embeddings_duration)} ---")
-        del numpy_embeddings
-        logger.info("Deleted numpy_embeddings array from memory.")
-        print("--- Deleted numpy_embeddings array from memory ---")
+        processed_docs_overall = 0
+        skipped_docs_overall_text_content = 0
+        skipped_docs_overall_doc_creation = 0
+        start_time_doc_processing_loop = time.time()
+        total_docs_to_process = len(docs_data_list)
 
-        # 2. Create the LangChain Docstore and index_to_docstore_id mapping (Optimized with batching and ETR)
-        logger.info("Creating LangChain Docstore and index_to_docstore_id mapping (Optimized with batching and ETR)...")
-        print(f"--- Creating LangChain Docstore ({len(docs_data_list)} docs) and mapping (Optimized with batching and ETR) ---")
-        docstore = InMemoryDocstore()
-        index_to_docstore_id = {}
-
-        doc_batch_for_docstore = {}
-        num_docs = len(docs_data_list)
-        skipped_docs_count = 0
-
-        start_time_docstore_loop = time.time() # Start time for this specific loop
+        logger.info(f"Processing {total_docs_to_process} documents and assigning to categories...")
+        print(f"--- Processing {total_docs_to_process} documents and assigning to categories ---")
 
         for i, doc_dict in enumerate(docs_data_list):
-            doc_id = str(uuid.uuid4())
-            index_to_docstore_id[i] = doc_id # Map FAISS index to its potential docstore ID
-
-            text_content = create_comprehensive_text_content(doc_dict)
+            doc_embedding = all_numpy_embeddings[i]
             
+            text_content = create_comprehensive_text_content(doc_dict)
             if text_content is None:
-                logger.warning(f"Doc idx {i} (FAISS ID {i}, generated doc_id {doc_id}) could not generate comprehensive text content. This document's embedding exists in FAISS but its text won't be fully retrievable from LangChain docstore. Ensure this is intended or fix data.")
-                skipped_docs_count += 1
-                # We still map its FAISS index to a doc_id, but the docstore won't have a meaningful entry.
-                # If you want to strictly skip this entry from docstore, remove it from index_to_docstore_id later,
-                # but then the direct FAISS index will have entries not reachable via LangChain FAISS wrapper.
-                # For consistency with FAISS, we keep the mapping, but the actual docstore entry might be missing/empty.
-                # A more robust solution might pre-filter docs_data_list and numpy_embeddings based on text_content presence
-                # *before* adding to the raw FAISS index. For now, we assume all FAISS indices are mapped.
-                continue # Skip adding this problematic doc to the docstore
+                original_doc_id_info = doc_dict.get('arxiv_id', f"original_index_{i}")
+                logger.warning(f"Doc (ID: {original_doc_id_info}) could not generate comprehensive text content. Skipping this document for all categories.")
+                skipped_docs_overall_text_content += 1
+                continue
+
+            doc_categories = get_doc_categories(doc_dict)
+            if not doc_categories:
+                doc_categories = ["uncategorized"] # Default category if none are specified
+                logger.info(f"Document {doc_dict.get('arxiv_id', f'original_index_{i}')} has no categories, assigning to 'uncategorized'.")
 
             metadata = doc_dict.copy()
+            # Ensure 'categories' in metadata is the list we are using for assignment
+            metadata['categories'] = doc_categories 
+
             try:
-                document = Document(page_content=text_content, metadata=metadata)
-                doc_batch_for_docstore[doc_id] = document
+                # We create one Document object, then assign its generated UUID to multiple category stores if needed.
+                # This avoids re-creating the Document object for each category, keeping metadata consistent.
+                # The doc_id will be unique across all categories.
+                doc_id = str(uuid.uuid4()) 
+                document_obj = Document(page_content=text_content, metadata=metadata)
             except Exception as doc_e:
-                print(f"!!! ERROR creating Document for idx {i} (ID {doc_id}): {doc_e}. Skipping for Docstore.")
-                logger.error(f"Error creating Document for idx {i} (ID {doc_id}): {doc_e}. Skipping for Docstore.", exc_info=True)
-                skipped_docs_count += 1
-            
-            # Add to InMemoryDocstore in batches or if it's the last item
-            processed_in_loop = i + 1
-            if len(doc_batch_for_docstore) >= DOCSTORE_ADD_BATCH_SIZE or processed_in_loop == num_docs:
-                if doc_batch_for_docstore:
-                    batch_size = len(doc_batch_for_docstore)
-                    # logger.info(f"Adding batch of {batch_size} docs to Docstore. Total processed for loop: {processed_in_loop}/{num_docs}.")
-                    docstore.add(doc_batch_for_docstore)
-                    doc_batch_for_docstore = {}
-                # elif processed_in_loop == num_docs: # This else-if is not strictly necessary but keeps the logic clear
-                    # logger.info(f"Final iteration reached ({processed_in_loop}/{num_docs}). No pending items in current batch.")
-            
-            # Overall progress logging with ETR for the docstore loop
-            if processed_in_loop % PROGRESS_LOG_INTERVAL == 0 and processed_in_loop > 0:
-                current_time = time.time()
-                elapsed_time_loop = current_time - start_time_docstore_loop
+                original_doc_id_info = doc_dict.get('arxiv_id', f"original_index_{i}")
+                print(f"!!! ERROR creating Document for {original_doc_id_info}: {doc_e}. Skipping this document for all categories.")
+                logger.error(f"Error creating Document for {original_doc_id_info}: {doc_e}. Skipping for all categories.", exc_info=True)
+                skipped_docs_overall_doc_creation += 1
+                continue
+
+            for category_name in doc_categories:
+                # Sanitize category_name to be a valid directory name
+                sane_category_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in category_name).strip('_')
+                if not sane_category_name: sane_category_name = "default_category"
+
+
+                current_category_docstore = docstores_by_category[sane_category_name]
+                current_category_embeddings = embeddings_by_category[sane_category_name]
+                current_category_idx_to_doc_id_map = index_to_docstore_id_by_category[sane_category_name]
+                current_category_batch = doc_batches_by_category[sane_category_name]
                 
+                # Add document to the batch for this category's docstore
+                current_category_batch[doc_id] = document_obj
+                
+                # Add embedding
+                current_category_embeddings.append(doc_embedding)
+                
+                # Map local FAISS index for this category to the global doc_id
+                # The local FAISS index will be len(current_category_embeddings) - 1
+                faiss_idx_in_category = len(current_category_embeddings) - 1
+                current_category_idx_to_doc_id_map[faiss_idx_in_category] = doc_id
+
+                # Check if the batch for this category is full
+                if len(current_category_batch) >= DOCSTORE_ADD_BATCH_SIZE:
+                    logger.info(f"Adding batch of {len(current_category_batch)} docs to Docstore for category '{sane_category_name}'.")
+                    current_category_docstore.add(current_category_batch)
+                    doc_batches_by_category[sane_category_name] = {} # Clear batch for this category
+            
+            processed_docs_overall +=1
+            if processed_docs_overall % PROGRESS_LOG_INTERVAL == 0 and processed_docs_overall > 0:
+                current_time = time.time()
+                elapsed_time_loop = current_time - start_time_doc_processing_loop
                 if elapsed_time_loop > 0:
-                    processing_rate_loop = processed_in_loop / elapsed_time_loop # items per second
-                    items_remaining_loop = num_docs - processed_in_loop
+                    processing_rate_loop = processed_docs_overall / elapsed_time_loop
+                    items_remaining_loop = total_docs_to_process - processed_docs_overall
                     if processing_rate_loop > 0:
                         etr_seconds_loop = items_remaining_loop / processing_rate_loop
                         etr_formatted_loop = format_time(etr_seconds_loop)
                         elapsed_formatted_loop = format_time(elapsed_time_loop)
-                        
-                        progress_message = (f"Docstore Loop: Processed {processed_in_loop}/{num_docs} ({processed_in_loop/num_docs*100:.2f}%). "
-                                            f"Elapsed: {elapsed_formatted_loop}. ETR: {etr_formatted_loop}.")
-                        logger.info(progress_message)
-                        print(f"--- {progress_message} ---")
-                    # else: # Unlikely if elapsed_time_loop > 0
-                        # logger.info(f"Docstore Loop: Processed {processed_in_loop}/{num_docs}. Calculating ETR...")
-                # else: # Very fast initial processing
-                    # logger.info(f"Docstore Loop: Processed {processed_in_loop}/{num_docs}. Calculating ETR...")
+                        logger.info(f"Document Processing Progress: {processed_docs_overall}/{total_docs_to_process}. Elapsed: {elapsed_formatted_loop}. ETR: {etr_formatted_loop}.")
+                        print(f"--- Document Processing Progress: {processed_docs_overall}/{total_docs_to_process}. Elapsed: {elapsed_formatted_loop}. ETR: {etr_formatted_loop}. ---")
 
-        total_time_docstore_loop = time.time() - start_time_docstore_loop
-        logger.info(f"Docstore population loop finished in {format_time(total_time_docstore_loop)}. {skipped_docs_count} documents were skipped or failed creation for docstore.")
-        print(f"--- Docstore population loop finished in {format_time(total_time_docstore_loop)}. {skipped_docs_count} docs skipped/failed. ---")
-
-        logger.info(f"Docstore contains {len(docstore._dict)} actual documents. index_to_docstore_id map created for {len(index_to_docstore_id)} FAISS entries.")
-        print(f"--- Docstore contains {len(docstore._dict)} actual documents. index_to_docstore_id map has {len(index_to_docstore_id)} entries ---")
-
-        if raw_faiss_index.ntotal != len(index_to_docstore_id):
-              print(f"!!! CRITICAL WARNING: FAISS index items ({raw_faiss_index.ntotal}) != index_to_docstore_id map size ({len(index_to_docstore_id)}).")
-              logger.critical(f"CRITICAL MISMATCH: FAISS items ({raw_faiss_index.ntotal}) vs index_map ({len(index_to_docstore_id)}). This means some FAISS embeddings might not have a corresponding LangChain document via this map.")
+        logger.info(f"Finished processing {processed_docs_overall} documents. Skipped (no text content): {skipped_docs_overall_text_content}. Skipped (doc creation error): {skipped_docs_overall_doc_creation}.")
+        print(f"--- Finished processing {processed_docs_overall} documents. ---")
         
-        # This check is more meaningful now as we're explicitly skipping adding docs to docstore if text_content is None.
-        expected_docstore_content_count = len(docs_data_list) - skipped_docs_count
-        if len(docstore._dict) != expected_docstore_content_count:
-            print(f"!!! WARNING: Docstore content size ({len(docstore._dict)}) != Expected ({expected_docstore_content_count} based on non-skipped docs). This could indicate internal issues with docstore.add or a slight mismatch in skip logic.")
-            logger.warning(f"Docstore content discrepancy: Actual {len(docstore._dict)}, Expected {expected_docstore_content_count} (based on non-skipped docs).")
+        # Add any remaining document batches to their respective category docstores
+        logger.info("Adding remaining document batches to respective category docstores...")
+        print("--- Adding remaining document batches to respective category docstores... ---")
+        for sane_category_name, batch_dict in doc_batches_by_category.items():
+            if batch_dict: # If there are any documents left in the batch for this category
+                logger.info(f"Adding final batch of {len(batch_dict)} docs to Docstore for category '{sane_category_name}'.")
+                docstores_by_category[sane_category_name].add(batch_dict)
+        logger.info("Finished adding remaining document batches.")
+        print("--- Finished adding remaining document batches. ---")
 
+        del all_numpy_embeddings # Free up memory
+        logger.info("Deleted original bulk numpy_embeddings array from memory.")
+        print("--- Deleted original bulk numpy_embeddings array from memory ---")
 
-        # Show sample of comprehensive text content for verification
-        if len(docs_data_list) > 0:
-            sample_doc = docs_data_list[0]
-            sample_text = create_comprehensive_text_content(sample_doc)
-            if sample_text:
-                logger.info(f"Sample comprehensive text content (first 300 chars): {sample_text[:300]}...")
+        # --- Build and Save FAISS index for each category ---
+        total_categories = len(docstores_by_category)
+        logger.info(f"Found {total_categories} unique categories. Building and saving FAISS index for each...")
+        print(f"--- Found {total_categories} unique categories. Building and saving FAISS index for each... ---")
+
+        for cat_idx, (category_name, cat_docstore) in enumerate(docstores_by_category.items()):
+            logger.info(f"Processing category {cat_idx + 1}/{total_categories}: '{category_name}'")
+            print(f"--- Processing category {cat_idx + 1}/{total_categories}: '{category_name}' ---")
+
+            cat_embeddings_list = embeddings_by_category[category_name]
+            cat_idx_to_doc_id_map = index_to_docstore_id_by_category[category_name]
+
+            if not cat_embeddings_list:
+                logger.warning(f"No embeddings found for category '{category_name}'. Skipping index creation for this category.")
+                print(f"!!! WARNING: No embeddings for category '{category_name}'. Skipping. !!!")
+                continue
+
+            cat_numpy_embeddings = np.array(cat_embeddings_list).astype('float32')
+            logger.info(f"Category '{category_name}': Found {len(cat_numpy_embeddings)} embeddings with shape {cat_numpy_embeddings.shape}.")
+            print(f"--- Category '{category_name}': {len(cat_numpy_embeddings)} embeddings, shape {cat_numpy_embeddings.shape} ---")
+
+            # Build raw FAISS index for the category
+            cat_raw_faiss_index = None
+            cat_faiss_res = None
+            if device == "cuda":
+                try:
+                    cat_faiss_res = faiss.StandardGpuResources()
+                    cat_raw_faiss_index = faiss.IndexFlatL2Gpu(cat_faiss_res, dimension, 0)
+                    logger.info(f"FAISS Index for '{category_name}' built successfully on GPU.")
+                except Exception as gpu_e:
+                    logger.warning(f"Could not build FAISS index for '{category_name}' on GPU: {gpu_e}. Falling back to CPU.")
+                    print(f"!!! WARNING: GPU FAISS for '{category_name}' failed: {gpu_e}. Falling back to CPU. !!!")
+                    cat_raw_faiss_index = faiss.IndexFlatL2(dimension)
+                    cat_faiss_res = None
             else:
-                logger.warning("Sample document could not generate comprehensive text content.")
+                cat_raw_faiss_index = faiss.IndexFlatL2(dimension)
+            
+            if cat_raw_faiss_index is None:
+                logger.error(f"Failed to create FAISS index for category '{category_name}'. Skipping.")
+                print(f"!!! ERROR: Failed to create FAISS for '{category_name}'. Skipping. !!!")
+                continue
 
-        # 3. Instantiate the LangChain FAISS vector store
-        logger.info("Instantiating LangChain FAISS wrapper...")
-        print("--- Instantiating LangChain FAISS wrapper ---")
-        langchain_faiss_store = LangChainFAISS(
-            embedding_function=lc_embedding_function, # Used for query embeddings
-            index=raw_faiss_index,                     # The pre-built raw FAISS index
-            docstore=docstore,                         # The LangChain docstore
-            index_to_docstore_id=index_to_docstore_id  # Mapping
-        )
-        logger.info("LangChain FAISS wrapper instantiated.")
-        print("--- LangChain FAISS wrapper instantiated ---")
+            logger.info(f"Adding {len(cat_numpy_embeddings)} embeddings to FAISS index for '{category_name}'...")
+            cat_raw_faiss_index.add(cat_numpy_embeddings)
+            logger.info(f"FAISS index for '{category_name}' built with {cat_raw_faiss_index.ntotal} embeddings.")
+            print(f"--- FAISS index for '{category_name}' built with {cat_raw_faiss_index.ntotal} embeddings ---")
 
-        # 4. Save the LangChain FAISS store
-        logger.info(f"Saving LangChain FAISS index to directory: {OUTPUT_FAISS_DIR}")
-        print(f"--- Saving LangChain FAISS index to directory: {OUTPUT_FAISS_DIR} ---")
-        if not os.path.exists(OUTPUT_FAISS_DIR):
-            os.makedirs(OUTPUT_FAISS_DIR)
-            print(f"--- Created output directory: {OUTPUT_FAISS_DIR} ---")
+            # Create LangChain FAISS object for the category
+            # Note: lc_embedding_function is the general one, not category-specific
+            try:
+                langchain_faiss_for_category = LangChainFAISS(
+                    embedding_function=lc_embedding_function, # Re-use the loaded embedding function
+                    index=cat_raw_faiss_index,
+                    docstore=cat_docstore,
+                    index_to_docstore_id=cat_idx_to_doc_id_map
+                )
+            except Exception as lc_faiss_e:
+                logger.error(f"Error creating LangChainFAISS object for category '{category_name}': {lc_faiss_e}. Skipping save.", exc_info=True)
+                print(f"!!! ERROR creating LangChainFAISS for '{category_name}': {lc_faiss_e}. Skipping save. !!!")
+                # If using GPU, ensure resources are freed for this failed category index
+                if cat_faiss_res is not None:
+                    del cat_faiss_res
+                    logger.info(f"Freed GPU resources for failed FAISS index of category '{category_name}'.")
+                if cat_raw_faiss_index is not None and hasattr(cat_raw_faiss_index, 'free'): # some GPU indexes have free
+                    cat_raw_faiss_index.free()
+                elif cat_raw_faiss_index is not None and hasattr(cat_raw_faiss_index, 'reset'): # CPU indexes have reset
+                     cat_raw_faiss_index.reset()
+                del cat_raw_faiss_index # Explicitly delete to help GC
+                continue # Skip to the next category
 
-        save_start_time = time.time()
-        langchain_faiss_store.save_local(OUTPUT_FAISS_DIR)
-        save_duration = time.time() - save_start_time
-        logger.info(f"LangChain FAISS index saved successfully in {format_time(save_duration)}.")
-        print(f"--- LangChain FAISS index saved successfully in {format_time(save_duration)} ---")
-        logger.info(f"IMPORTANT: The new index now includes comprehensive text (title + categories + authors + abstract) for better retrieval!")
-        logger.info(f"You can now load the index from '{OUTPUT_FAISS_DIR}'.")
-        print(f"--- You can now load the index from '{OUTPUT_FAISS_DIR}' ---")
+
+            # Save the LangChain FAISS index for the category
+            category_output_dir = os.path.join(OUTPUT_FAISS_DIR, category_name)
+            if not os.path.exists(category_output_dir):
+                os.makedirs(category_output_dir)
+            
+            # LangChainFAISS.save_local takes folder_path, index_name="index"
+            # This will create "index.faiss" and "index.pkl" inside category_output_dir
+            try:
+                langchain_faiss_for_category.save_local(folder_path=category_output_dir, index_name="index")
+                logger.info(f"Saved LangChain FAISS index for category '{category_name}' to: {category_output_dir}")
+                print(f"--- Saved LangChain FAISS index for '{category_name}' to: {category_output_dir} ---")
+            except Exception as save_e:
+                logger.error(f"Error saving LangChainFAISS index for category '{category_name}' to {category_output_dir}: {save_e}", exc_info=True)
+                print(f"!!! ERROR saving LangChainFAISS for '{category_name}' to {category_output_dir}: {save_e} !!!")
+
+            # Clean up GPU resources if they were used for this category's index
+            if cat_faiss_res is not None:
+                del cat_faiss_res # This should free GPU memory associated with this specific index
+                logger.info(f"Freed GPU resources for FAISS index of category '{category_name}'.")
+            if cat_raw_faiss_index is not None and hasattr(cat_raw_faiss_index, 'free'): # some GPU indexes have free
+                cat_raw_faiss_index.free()
+            elif cat_raw_faiss_index is not None and hasattr(cat_raw_faiss_index, 'reset'): # CPU indexes have reset
+                 cat_raw_faiss_index.reset()
+            del cat_raw_faiss_index # Explicitly delete to help GC
+            del langchain_faiss_for_category # Explicitly delete to help GC
+            del cat_numpy_embeddings # Free category-specific embeddings
+            logger.info(f"Cleaned up resources for category '{category_name}'.")
+
+        logger.info("All categories processed.")
+        print("--- All categories processed. ---")
 
     except Exception as e:
-        print(f"\n!!! AN ERROR OCCURRED DURING FAISS INDEX CREATION !!!")
-        print(f"!!! Error details: {e} !!!")
-        logger.error(f"An error occurred during FAISS index creation: {e}", exc_info=True)
+        print(f"!!! ERROR in main processing block: {e}")
+        logger.error(f"An unexpected error occurred in main processing block: {e}", exc_info=True)
     finally:
-        if 'faiss_res' in locals() and faiss_res is not None:
-            logger.info("FAISS GPU resources will be garbage collected.")
-            print("--- FAISS GPU resources will be garbage collected ---")
-            # faiss_res = None # Let Python GC handle it
+        print("--- Script End ---")
+        logger.info("Script finished.")
 
-    print("\n--- Script Finished ---")
 
 if __name__ == "__main__":
     main()

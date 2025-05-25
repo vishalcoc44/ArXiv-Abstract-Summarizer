@@ -26,7 +26,7 @@ class AppConfig:
     # Llama.cpp model parameters
     LLAMA_N_CTX = int(os.getenv('LLAMA_N_CTX', '8192'))  # Increased from 4092
     LLAMA_N_GPU_LAYERS = int(os.getenv('LLAMA_N_GPU_LAYERS', '-1'))
-    LLAMA_VERBOSE = os.getenv('LLAMA_VERBOSE', 'False').lower() == 'true'
+    LLAMA_VERBOSE = True  # Set to True as per instructions
 
     # Flask App settings
     FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'

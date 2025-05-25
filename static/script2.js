@@ -220,6 +220,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const mainContentTitle = document.querySelector('.initial-prompt-area h1'); 
     const suggestionCards = document.querySelectorAll('.suggestion-cards .card');
     const chatHeaderTitleElement = document.querySelector('.chat-header .current-chat-name h2');
+    const exportChatBtn = document.getElementById('export-chat-btn'); // Added export button
+    const clearAllChatsBtn = document.getElementById('clear-all-chats-btn'); // Added clear all chats button
 
     let currentActiveChatId = null; // To store the ID of the currently active chat
 
@@ -246,19 +248,73 @@ document.addEventListener('DOMContentLoaded', () => {
     if (existingMessages.length > 0 && initialPromptArea) {
         initialPromptArea.style.display = 'none'; 
         gsap.set(chatOutput, {opacity: 1}); 
-        gsap.fromTo(existingMessages, 
-            { opacity: 0, y: 25 }, 
-            {
-                opacity: 1, 
-                y: 0, 
-                duration: 0.6, 
-                stagger: 0.1,  
-                ease: 'power2.out', 
-                delay: pageLoadTl.duration() - 0.8 
-            }
-        );
     }
 
+    // --- Interactive Element Animations ---
+    function applyButtonAnimations(selector) {
+        const buttons = document.querySelectorAll(selector);
+        buttons.forEach(button => {
+            // Hover animation
+            button.addEventListener('mouseenter', () => {
+                gsap.to(button, { 
+                    scale: 1.05, 
+                    filter: 'brightness(1.1)',
+                    duration: 0.2, 
+                    ease: 'power1.out' 
+                });
+            });
+            button.addEventListener('mouseleave', () => {
+                gsap.to(button, { 
+                    scale: 1, 
+                    filter: 'brightness(1)',
+                    duration: 0.2, 
+                    ease: 'power1.inOut' 
+                });
+            });
+
+            // Click animation
+            button.addEventListener('mousedown', () => {
+                gsap.to(button, { 
+                    scale: 0.95, 
+                    filter: 'brightness(0.9)',
+                    duration: 0.1, 
+                    ease: 'power1.out' 
+                });
+            });
+            button.addEventListener('mouseup', () => { // Also handle mouseup outside
+                gsap.to(button, { 
+                    scale: 1.05, // Return to hover state if mouse is still over
+                    filter: 'brightness(1.1)',
+                    duration: 0.1, 
+                    ease: 'power1.inOut' 
+                });
+            });
+             button.addEventListener('click', () => { // Ensure it returns to a good state after click
+                gsap.to(button, { 
+                    scale: 1.05, // Match hover state briefly
+                    filter: 'brightness(1.1)', 
+                    duration: 0.05, 
+                    onComplete: () => {
+                        // If mouse is not over after click, return to normal
+                        if (!button.matches(':hover')) {
+                             gsap.to(button, { scale: 1, filter: 'brightness(1)', duration: 0.1});
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    // Apply to general icon buttons
+    applyButtonAnimations('.icon-btn');
+    applyButtonAnimations('.new-chat-btn');
+    applyButtonAnimations('.model-btn');
+    applyButtonAnimations('.filter-btn');
+    // Add other selectors if needed, e.g., modal buttons:
+    // applyButtonAnimations('.modal-btn');
+
+
+    // --- GSAP Helper Functions (e.g., Typewriter, H1 split) ---
     function splitAndAnimateH1(element, delay = 0) {
         if (!element) return;
         const text = element.textContent;
@@ -1796,5 +1852,95 @@ document.addEventListener('DOMContentLoaded', () => {
     // Load saved theme on page load
     const savedTheme = localStorage.getItem('theme') || 'dark'; // Default to dark
     applyTheme(savedTheme);
+
+    // --- Export Chat Functionality ---
+    if (exportChatBtn) {
+        // Click animation for export button
+        const exportClickTl = gsap.timeline({ paused: true });
+        exportClickTl.to(exportChatBtn, { scale: 0.9, duration: 0.1, ease: 'power1.inOut' })
+                     .to(exportChatBtn, { scale: 1, duration: 0.1, ease: 'power1.inOut' });
+
+        exportChatBtn.addEventListener('click', () => {
+            exportClickTl.restart(); // Play click animation
+            exportCurrentChat();
+        });
+    }
+
+    async function exportCurrentChat() {
+        if (!currentActiveChatId) {
+            alert("Please select a chat to export.");
+            return;
+        }
+
+        try {
+            // Fetch all messages for the current chat
+            const response = await fetch(`/api/chats/${currentActiveChatId}/messages`);
+            if (!response.ok) {
+                const errData = await response.json().catch(() => ({ error: `HTTP error! Status: ${response.status}` }));
+                throw new Error(errData.error || `Failed to fetch messages for chat ${currentActiveChatId} for export.`);
+            }
+            const data = await response.json();
+
+            if (!data.messages || data.messages.length === 0) {
+                alert("No messages in the current chat to export.");
+                return;
+            }
+
+            let chatContent = `Chat Title: ${data.title || chatHeaderTitleElement.textContent}\n\n`; // Use fetched title if available
+            data.messages.forEach(msg => {
+                const sender = msg.sender === 'user' ? "User" : "Bot";
+                // Assuming msg.content contains the raw (markdown or plain) text
+                const text = msg.content || '[empty message]';
+                chatContent += `${sender}: ${text}\n------------------------------------\n`;
+            });
+
+            const blob = new Blob([chatContent], { type: 'text/plain;charset=utf-8' });
+            const chatTitleForFile = (data.title || chatHeaderTitleElement.textContent).replace(/[^a-z0-9]/gi, '_').toLowerCase() || 'chat_export';
+            const filename = `${chatTitleForFile}.txt`;
+            
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(link.href);
+
+        } catch (error) {
+            console.error('Error exporting chat:', error);
+            alert(`Could not export chat: ${error.message}`);
+        }
+    }
+
+    // --- Clear All Chats Functionality ---
+    if (clearAllChatsBtn) {
+        clearAllChatsBtn.addEventListener('click', async () => {
+            const confirmed = confirm("Are you sure you want to delete ALL chats? This action cannot be undone.");
+            if (confirmed) {
+                try {
+                    const response = await fetch('/api/chats/clear-all', {
+                        method: 'DELETE',
+                    });
+                    if (!response.ok) {
+                        const errData = await response.json().catch(() => ({ error: `HTTP Error ${response.status}` }));
+                        throw new Error(errData.error || 'Failed to clear all chats');
+                    }
+                    // Successfully cleared chats
+                    chatOutput.innerHTML = ''; // Clear current chat view
+                    updateChatHeaderTitle('Select a Chat'); // Reset header
+                    currentActiveChatId = null; // Reset active chat ID
+                    if (initialPromptArea) { // Show initial prompt area
+                        initialPromptArea.style.display = 'flex';
+                        gsap.fromTo(initialPromptArea, {opacity: 0, y: 30}, {opacity: 1, y: 0, duration: 0.6, ease: 'expo.out'});
+                    }
+                    fetchAndRenderSidebarData(); // Refresh sidebar (should be empty or show default state)
+                    alert("All chats have been cleared.");
+                } catch (error) {
+                    console.error("Error clearing all chats:", error);
+                    alert(`Could not clear all chats: ${error.message}`);
+                }
+            }
+        });
+    }
 
 });
