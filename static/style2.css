@@ -359,6 +359,26 @@ body {
     margin: 0 12px;
 }
 
+/* Added style for the logo placeholder */
+.chat-header-logo-placeholder {
+    width: 30px; /* Example width */
+    height: 30px; /* Example height */
+    background-color: #fafafa; /* Example placeholder color */
+    border-radius: 4px; /* Optional: rounded corners */
+    margin-right: 10px; /* Space between logo and model tag */
+    /* Add any other styling you need, e.g., for an actual image */
+    display: flex; /* Added to help with image alignment if needed */
+    align-items: center; /* Added to help with image alignment if needed */
+    justify-content: center; /* Added to help with image alignment if needed */
+}
+
+/* Added to control the image size within the placeholder */
+.chat-header-logo-placeholder img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain; /* Ensures the image fits and maintains aspect ratio */
+}
+
 .chat-model-tag {
     background-color: var(--bg-tertiary);
     color: var(--text-secondary);

@@ -72,7 +72,9 @@
             <header class="chat-header">
                 <div class="current-chat-name">
                     <button class="icon-btn"><i class="fas fa-chevron-left"></i></button>
-                    <h2>Name chat</h2>
+                    <div class="chat-header-logo-placeholder">
+                        <img src="{{ url_for('static', filename='arxiv-logo.png') }}" alt="ArXiv Logo">
+                    </div>
                     <span class="chat-model-tag">ArXiv Retrieval</span>
                 </div>
                 <div class="chat-actions">
