@@ -135,10 +135,26 @@ class ModelManager:
             if AppConfig.CLOUD_DEPLOYMENT and AppConfig.CLOUD_STORAGE_BUCKET:
                 self._download_model_from_cloud()
             
+            # Determine number of threads for Llama.cpp
+            # Default to half of CPU cores if not specified, or 1 if cpu_count fails.
+            num_threads = getattr(AppConfig, 'LLAMA_N_THREADS', None)
+            if num_threads is None:
+                cpu_cores = os.cpu_count()
+                if cpu_cores:
+                    num_threads = cpu_cores // 2
+                else:
+                    num_threads = 1 # Fallback if cpu_count is not available
+                logger.info(f"AppConfig.LLAMA_N_THREADS not set, defaulting to {num_threads} threads.")
+            else:
+                logger.info(f"Using AppConfig.LLAMA_N_THREADS: {num_threads} threads.")
+
+
             model = Llama(
                 model_path=AppConfig.LOCAL_MODEL_PATH,
                 n_ctx=AppConfig.LLAMA_N_CTX,
                 n_gpu_layers=AppConfig.LLAMA_N_GPU_LAYERS,
+                n_batch=AppConfig.LLAMA_N_BATCH,
+                n_threads=num_threads, # Added n_threads
                 verbose=AppConfig.LLAMA_VERBOSE
             )
             self._model_cache['model'] = model
@@ -362,223 +378,11 @@ def load_category_faiss_index(category_key: str | None) -> FAISS | None:
         return None
 
 # --- Model Generation Logic ---
-def generate_gemini_response(prompt, chat_id=None):
-    if not systems_status["gemini_model_configured"]:
-        yield "Gemini API key not configured. Cannot generate response."
-        return
-
-    logger.info(f"Sending prompt to Gemini: {prompt[:200]}...")
-    current_cancel_event = get_cancellation_event(chat_id) if chat_id else None
-
-    try:
-        response = requests.post(
-            AppConfig.GEMINI_API_URL + f"?key={AppConfig.GEMINI_API_KEY}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": AppConfig.LLAMA_TEMPERATURE, # Using similar settings for consistency
-                    "topP": AppConfig.LLAMA_TOP_P,
-                    "maxOutputTokens": AppConfig.LLAMA_MAX_TOKENS
-                }
-            },
-            stream=True, # This might not be directly supported by Gemini's non-Vertex AI REST API for generateContent
-            timeout=120 # Increased timeout
-        )
-        response.raise_for_status()
-
-        full_response_content = ""
-        # The standard generateContent API might not stream token by token in the same way as an SSE stream.
-        # It might stream larger chunks or the full response. Adapt based on observed behavior.
-        # For now, assuming it might send JSON chunks if it streams, or one full JSON.
-        
-        # If response.iter_lines() or response.iter_content() is used, proper decoding is needed.
-        # Assuming it's a single JSON response for now, or that stream=True isn't fully effective here.
-        
-        # Let's try to handle it as if it might be a single JSON object, or a stream of them (less likely for this API endpoint)
-        # A more robust solution would inspect Content-Type and handle SSE if present.
-
-        response_json = response.json() # This will block until full response if not streaming effectively
-        
-        if 'candidates' in response_json and response_json['candidates']:
-            parts = response_json['candidates'][0].get('content', {}).get('parts', [])
-            for part in parts:
-                if 'text' in part:
-                    text_chunk = part['text']
-                    yield text_chunk
-                    full_response_content += text_chunk
-        elif 'error' in response_json:
-            error_message = response_json['error'].get('message', 'Unknown Gemini API error')
-            logger.error(f"Gemini API error: {error_message}")
-            yield f"\n\n[Error from Gemini: {error_message}]"
-            return
-
-        if not full_response_content:
-             yield "\n\n[Gemini returned an empty response.]"
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Gemini API request failed: {e}", exc_info=True)
-        yield f"\n\n[Error connecting to Gemini: {e}]"
-    except Exception as e:
-        logger.error(f"Error processing Gemini response: {e}", exc_info=True)
-        yield f"\n\n[Error processing Gemini response: {e}]"
-
-def get_gemini_paper_suggestions(user_query_for_gemini: str, conversation_history: str = "", chat_id: str | None = None, subject_hint: str | None = None, num_papers_to_suggest: int | None = None) -> list[dict[str, str | None]]:
-    if not systems_status["gemini_model_configured"]:
-        logger.warning("Gemini API key not configured. Cannot get paper suggestions.")
-        return []
-
-    # Determine number of papers for the prompt
-    num_papers_prompt_val = num_papers_to_suggest if num_papers_to_suggest and 1 <= num_papers_to_suggest <= 10 else 5 # Default to 5, max 10
-
-    prompt = (
-        f"You are an expert ArXiv research paper discovery assistant. Your goal is to identify and suggest relevant academic papers from ArXiv based on the user's query and conversation history. "
-        f"DO NOT MAKE UP PAPERS. Only suggest real papers that you can find or strongly infer exist on ArXiv.\\n\\n"
-        f"Conversation History (if any):\\n{conversation_history}\\n\\n"
-        f"User's Latest Query: {user_query_for_gemini}\\n\\n"
-    )
-    if subject_hint:
-        prompt += f"The user seems interested in the ArXiv category (or related to): {subject_hint}. Prioritize papers from this field or closely related fields if appropriate, but also consider broader relevance to the query.\\n"
-    
-    prompt += (
-        f"Please suggest exactly {num_papers_prompt_val} relevant papers from ArXiv. "
-        f"For each paper, provide the following information in a VALID JSON list format. Each item in the list should be a JSON object with these EXACT keys: \\\"title\\\", \\\"authors\\\" (as a list of strings), \\\"arxiv_id\\\" (as a string, e.g., \\\"2305.12345\\\"), and \\\"abstract\\\" (a concise summary of the paper's abstract, around 2-4 sentences, focusing on key findings and relevance to the query).\\n"
-        f"Example of a single paper object in the list: {{\"title\": \\\"Example Paper Title\\\", \\\"authors\\\": [\\\"Author One\\\", \\\"Author Two\\\"], \\\"arxiv_id\\\": \\\"2101.00001\\\", \\\"abstract\\\": \\\"This paper discusses X and presents Y. It is relevant because Z.\\\"}}\\n\\n"
-        f"Output only the JSON list of paper objects. Do not include any other text, explanations, or markdown formatting around the JSON. Ensure the JSON is perfectly parsable."
-    )
-    
-    logger.info(f"Sending prompt to Gemini for paper suggestions (query: '{user_query_for_gemini[:100]}...', subject: {subject_hint}, num: {num_papers_prompt_val})")
-
-    try:
-        gemini_response_start_time = time.perf_counter()
-        response = requests.post(
-            AppConfig.GEMINI_API_URL + f"?key={AppConfig.GEMINI_API_KEY}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.4, # Slightly higher for suggestion diversity
-                    "topP": 0.95,
-                    "maxOutputTokens": 3072, # Increased to accommodate multiple paper details
-                    "responseMimeType": "application/json", # Request JSON output
-                }
-            },
-            timeout=180 # Increased timeout for potentially complex search and JSON generation
-        )
-        gemini_response_duration = time.perf_counter() - gemini_response_start_time
-        logger.info(f"[PERF] Gemini API call for paper suggestions took: {gemini_response_duration:.4f} seconds.")
-        
-        response.raise_for_status()
-        
-        response_text = response.text
-        logger.debug(f"Raw Gemini response for paper suggestions: {response_text[:500]}...")
-
-        # Attempt to extract JSON from the response
-        # Gemini with responseMimeType: "application/json" should return just the JSON
-        # but sometimes it might be wrapped in markdown or have prefixes/suffixes.
-        
-        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1).strip()
-            logger.info("Extracted JSON from Gemini response using regex (markdown code block).")
-        else:
-            # If no markdown block, assume the whole response (or a significant part of it) is the JSON
-            # This might need more sophisticated cleaning if Gemini adds other text.
-            # For now, try to find the start of a list or object.
-            first_brace = response_text.find('[')
-            first_curly = response_text.find('{')
-
-            if first_brace == -1 and first_curly == -1:
-                logger.error(f"No JSON array or object start found in Gemini response: {response_text}")
-                return []
-            
-            if first_brace != -1 and (first_curly == -1 or first_brace < first_curly) :
-                json_str = response_text[first_brace:]
-            else: # first_curly != -1 and (first_brace == -1 or first_curly < first_brace)
-                json_str = response_text[first_curly:]
-            
-            # Attempt to balance brackets for lists or objects
-            # This is a simplistic approach and might not cover all edge cases.
-            open_brackets = 0
-            last_char_index = -1
-
-            if json_str.startswith('['):
-                target_open, target_close = '[', ']'
-            elif json_str.startswith('{'): # Should be a list, but as a fallback
-                target_open, target_close = '{', '}'
-            else: # Should not happen if first_brace/first_curly logic is correct
-                logger.error(f"JSON string does not start with '[' or '{{': {json_str[:100]}")
-                return []
-
-            for i, char in enumerate(json_str):
-                if char == target_open:
-                    open_brackets += 1
-                elif char == target_close:
-                    open_brackets -= 1
-                
-                if open_brackets == 0:
-                    last_char_index = i
-                    break
-            
-            if last_char_index != -1:
-                json_str = json_str[:last_char_index+1]
-            else:
-                logger.warning("Could not balance brackets in JSON response, using potentially truncated string.")
-
-
-            logger.info(f"Attempting to parse as JSON (guessed boundaries): {json_str[:200]}...")
-
-
-        # Repair potential invalid escape sequences before parsing
-        json_str_repaired = repair_json_invalid_escapes(json_str)
-
-        try:
-            data = json.loads(json_str_repaired)
-            
-            # Attempt to extract the actual list of papers from the response structure
-            actual_papers_list = None
-            if isinstance(data, dict) and 'candidates' in data:
-                candidates = data['candidates']
-                if isinstance(candidates, list) and len(candidates) > 0:
-                    content = candidates[0].get('content')
-                    if isinstance(content, dict) and 'parts' in content:
-                        parts = content['parts']
-                        if isinstance(parts, list) and len(parts) > 0:
-                            text_data = parts[0].get('text')
-                            if isinstance(text_data, str):
-                                try:
-                                    # The text itself is another JSON string representing the list
-                                    actual_papers_list = json.loads(text_data)
-                                except json.JSONDecodeError as e_inner:
-                                    logger.error(f"Failed to parse the 'text' field as JSON: {e_inner}. Text field content: {text_data[:200]}")
-                                    actual_papers_list = None # Ensure it's None if parsing fails
-
-            if isinstance(actual_papers_list, list):
-                logger.info(f"Successfully parsed {len(actual_papers_list)} paper suggestions from Gemini's nested structure.")
-                # Basic validation of expected keys for a few items
-                for item in actual_papers_list[:2]: # Check first two items
-                    if not all(k in item for k in ["title", "authors", "arxiv_id", "abstract"]):
-                        logger.warning(f"Gemini paper suggestion item missing expected keys: {item}")
-                        # Decide if to discard item or whole list
-                return actual_papers_list
-            elif isinstance(data, list): # Fallback for old structure, though logs indicate it's the new dict structure
-                logger.warning("Gemini response was a list directly. This might be an older format or unexpected.")
-                # This path should ideally not be taken based on current logs
-                for item in data[:2]: 
-                    if not all(k in item for k in ["title", "authors", "arxiv_id", "abstract"]):
-                        logger.warning(f"Gemini paper suggestion item (direct list) missing expected keys: {item}")
-                return data
-            else:
-                logger.error(f"Gemini response parsed but is not a list and expected nested structure not found: {type(data)}. Content: {str(data)[:200]}")
-                return []
-        except json.JSONDecodeError as e:
-            logger.error(f"JSONDecodeError parsing Gemini paper suggestions: {e}. Repaired String: {json_str_repaired[:500]}", exc_info=True)
-            return []
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Gemini API request failed for paper suggestions: {e}", exc_info=True)
-        return []
-    except Exception as e:
-        logger.error(f"Error processing Gemini paper suggestions response: {e}", exc_info=True)
-        return []
+# --- generate_gemini_response and get_gemini_paper_suggestions are being removed ---
+# def generate_gemini_response(prompt, chat_id=None):
+#     ...
+# def get_gemini_paper_suggestions(user_query_for_gemini: str, ...):
+#     ...
 
 
 def generate_local_rag_response(user_query_with_history: str, chat_id=None):
@@ -701,8 +505,8 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             current_faiss_index_to_use = load_category_faiss_index(category_key_for_faiss)
             if current_faiss_index_to_use:
                 # Determine how many docs to retrieve. More than requested to give LLM a choice.
-                k_for_faiss_search = (num_papers_requested * 2) + 5 # e.g., if 5 requested, get 15
-                k_for_faiss_search = min(max(k_for_faiss_search, 10), 25) # Ensure it's between 10 and 25
+                k_for_faiss_search = num_papers_requested + 1 # Further reduced k
+                k_for_faiss_search = min(max(k_for_faiss_search, 5), 15) # Ensure it's sensible (e.g., min 5, max 15)
                 
                 logger.info(f"Searching FAISS category '{category_key_for_faiss}' for '{actual_user_question}' with k={k_for_faiss_search}")
                 rag_faiss_search_start_time = time.perf_counter()
@@ -720,6 +524,16 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                         # relevant_docs = [doc for doc, score in docs_with_scores if score < 0.85] # Example score filter
                         retrieved_context_docs_for_papers = [doc for doc, score in docs_with_scores] # Taking all
                         logger.info(f"Retrieved {len(retrieved_context_docs_for_papers)} documents from FAISS for paper query.")
+                        
+                        # --- Added Logging for FAISS output ---
+                        logger.info(f"--- Top FAISS results for query '{actual_user_question}' in category '{category_key_for_faiss}' (before Gemma processing) ---")
+                        for i_doc, doc_retrieved in enumerate(retrieved_context_docs_for_papers):
+                            doc_title = doc_retrieved.metadata.get('title', 'N/A Title')
+                            doc_abstract_snippet = doc_retrieved.metadata.get('abstract', doc_retrieved.page_content or '')[:150]
+                            logger.info(f"FAISS Doc {i_doc+1}: Title: {doc_title} | Abstract Snippet: {doc_abstract_snippet}...")
+                        logger.info("--- End of FAISS results log ---")
+                        # --- End of Added Logging ---
+
                     else:
                         logger.info(f"No documents returned from FAISS search for paper query in category '{category_key_for_faiss}'.")
                 except Exception as e_local_faiss_paper_search:
@@ -743,13 +557,20 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                     authors = ["N/A"]
 
                 arxiv_id = doc.metadata.get("arxiv_id", "N/A").strip()
-                local_abstract = doc.metadata.get("abstract", doc.page_content if doc.page_content else "N/A").strip()
+                local_abstract_full = doc.metadata.get("abstract", doc.page_content if doc.page_content else "N/A").strip()
+                
+                # Truncate abstract for Gemma's context to reduce prompt size
+                MAX_ABSTRACT_LEN_FOR_PROMPT = 600 
+                if len(local_abstract_full) > MAX_ABSTRACT_LEN_FOR_PROMPT:
+                    local_abstract_truncated = local_abstract_full[:MAX_ABSTRACT_LEN_FOR_PROMPT] + "... (truncated)"
+                else:
+                    local_abstract_truncated = local_abstract_full
 
                 papers_for_gemma_synthesis.append({
                     "title": title,
                     "authors": authors,
                     "arxiv_id": arxiv_id,
-                    "chosen_abstract": local_abstract, # Using local abstract directly
+                    "chosen_abstract": local_abstract_truncated, # Use truncated abstract for prompt
                     "abstract_source": f"Local FAISS ({category_key_for_faiss})"
                 })
             logger.info(f"Prepared {len(papers_for_gemma_synthesis)} papers from local FAISS for Gemma synthesis.")
@@ -767,12 +588,33 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                 )
             context_str = "\\n".join(context_papers_str_parts)
 
+            # Determine subject for prompt and specific guidance
+            subject_for_prompt_display = "relevant" # Default
+            subject_guidance_noun = "academic" # Default noun for guidance
+            
+            if extracted_subject_for_gemini_hint and extracted_subject_for_gemini_hint.lower() != "uncategorized":
+                subject_for_prompt_display = extracted_subject_for_gemini_hint.lower()
+                subject_guidance_noun = subject_for_prompt_display
+            elif category_key_for_faiss and category_key_for_faiss != "uncategorized":
+                subject_for_prompt_display = category_key_for_faiss.replace("_", " ").lower()
+                subject_guidance_noun = subject_for_prompt_display
+            
+            subject_specific_guidance = (
+                f"Prioritize papers presenting direct research in {subject_guidance_noun} "
+                f"(e.g., specific theories, experimental results, new algorithms, models, or analyses within {subject_guidance_noun}) "
+                f"over general surveys, textbooks, bibliometric studies, or collections (like 'Selected Papers', 'Proceedings', 'Bulletins', 'This Week\'s Finds'), "
+                f"unless these collections themselves are the explicit subject of the query or the abstract clearly indicates a specific, citable research contribution directly relevant to the user's query. "
+                f"The user is looking for substantive research contributions, not just any document that mentions '{subject_guidance_noun}'. "
+                f"Pay close attention to the titles of the documents; titles like 'Bulletin', 'Selected Works', 'Weekly Finds', or overly broad titles (e.g., 'Graph Theory' as a standalone title for a research paper query) are often indicators that the document might not be a specific research paper but rather a collection, periodical, or textbook chapter. Filter these out unless the abstract clearly indicates a specific, citable research contribution highly relevant to the user's query. "
+            )
+
             prompt_instruction = (
                 f"You are an AI research assistant. Based on the user's query and the following retrieved academic document summaries from our local ArXiv database, "
-                f"please identify and present up to {num_papers_requested} of the most relevant papers. "
-                f"For each selected paper, provide its Title, Authors, ArXiv ID, and a concise 2-4 sentence summary derived from its provided abstract, highlighting its relevance to the user's query. "
-                f"If fewer than {num_papers_requested} relevant papers are found in the provided context, list only those that are relevant. "
-                f"If no relevant papers are found in the context, state that. Do not make up papers or information not present in the provided document summaries."
+                f"please identify and present up to {num_papers_requested} of the most relevant **{subject_for_prompt_display} research papers that discuss specific {subject_for_prompt_display} topics or findings.** "
+                f"{subject_specific_guidance} "
+                f"For each selected paper, provide its Title, Authors, ArXiv ID, and a concise 2-4 sentence summary derived from its provided abstract, highlighting its **key {subject_for_prompt_display} concepts or findings** and explaining why it's a relevant {subject_for_prompt_display} research paper in the context of the user's query. "
+                f"If fewer than {num_papers_requested} relevant {subject_for_prompt_display} papers are found in the provided context, list only those that are relevant. "
+                f"If no relevant {subject_for_prompt_display} papers are found in the context, state that clearly. Do not make up papers or information not present in the provided document summaries."
             )
 
             parts = [
@@ -798,7 +640,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             # We set prompt_for_gemma to empty here to ensure it falls through if is_paper_query was true but no papers found.
             prompt_for_gemma = ""
 
-
+            
     # General RAG or fallback if paper query yielded no specific papers to synthesize (and not DEBUG_SKIP_AUGMENTATION)
     # This block will also be hit if is_paper_query was true but papers_for_gemma_synthesis remained empty.
     if not prompt_for_gemma and not DEBUG_SKIP_AUGMENTATION: # Check if prompt_for_gemma was set by paper query block

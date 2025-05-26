@@ -544,8 +544,20 @@ body {
 
 .message p {
     margin: 0;
-    white-space: pre-wrap; /* Preserve line breaks and wrap text */
-    word-break: break-word;
+    line-height: 1.6;
+    word-wrap: break-word; /* Ensure long words break and don't overflow */
+    white-space: pre-wrap; /* Preserve whitespace and newlines from input, wrap as needed */
+}
+
+/* Add this to reset list styling within message content paragraphs */
+.message p ul,
+.message p ol {
+    padding-left: 20px; /* Or your desired indent, '0' if no indent */
+    margin-left: 0; /* Reset any browser default margin */
+}
+
+.message p li {
+    /* Adjust list item styling if needed, e.g., margin-bottom */
 }
 
 .user-message {

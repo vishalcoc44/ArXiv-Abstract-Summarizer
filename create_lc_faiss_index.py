@@ -222,7 +222,7 @@ def main():
 
         for i, doc_dict in enumerate(docs_data_list):
             doc_embedding = all_numpy_embeddings[i]
-            
+
             text_content = create_comprehensive_text_content(doc_dict)
             if text_content is None:
                 original_doc_id_info = doc_dict.get('arxiv_id', f"original_index_{i}")

@@ -847,10 +847,41 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             logger.info(f"[PERF] Total FAISS processing time for all Gemini suggestions: {faiss_processing_total_time:.4f} seconds.")
         
         if papers_for_gemma_synthesis:
-            parts = ["<start_of_turn>user\\\nYou are an AI research assistant. Analyze papers relative to user query.\\nUSER'S QUERY:\\n---\\n" + actual_user_question + "\\n---\\nPAPERS (Title, Authors, ArXiv ID, Abstract):\\n===\\"]
+            parts = ["<start_of_turn>user\\\nYou are an AI research assistant. You will be given a user's query and a list of research papers (with titles, authors, ArXiv IDs, and their original abstracts). Your task is to analyze these papers in relation to the user's query.\nUSER'S QUERY:\n---\n" + actual_user_question + "\n---\nPAPERS:\n==="]
             for i, p in enumerate(papers_for_gemma_synthesis):
-                parts.append(f"Paper {i+1}: {p['title']}\\\nAuthors: {(', '.join(p['authors']) if p['authors'] else 'N/A')}\\\nArXiv ID: {(p['arxiv_id'] if p['arxiv_id'] else 'N/A')}\\\nAbstract:\\n{p.get('chosen_abstract', 'N/A')}\\\n---")
-            parts.append("End of Paper Details.\\nRequired output for EACH paper: 1. Paper [Number]: [Title]. 2. Authors: [Names]. 3. ArXiv ID: [ID]. 4. YOUR 2-4 sentence summary of GIVEN ABSTRACT relating to USER QUERY. Do NOT repeat abstract. State if irrelevant. NO source info.\\nBegin with Paper 1.\\n<end_of_turn>\\\n<start_of_turn>model\\\nAnalysis:")
+                parts.append(f"Paper {i+1}:\nTitle: {p['title']}\
+Authors: {(', '.join(p['authors']) if p['authors'] else 'N/A')}\
+ArXiv ID: {(p['arxiv_id'] if p['arxiv_id'] else 'N/A')}\
+Abstract:\n{p.get('chosen_abstract', 'N/A')}\
+---GROUP_SEPARATOR---") # Using a clear separator
+            
+            parts.append(
+                "End of Paper Details.\n\n" 
+                "INSTRUCTIONS FOR YOUR RESPONSE:\n"
+                "You have been provided with a list of research papers. Each paper's information in the input I gave you is followed by a line that reads '---GROUP_SEPARATOR---'. This line is only for you to know where one paper's input ends and the next begins.\n\n"
+                "YOUR TASK:\n"
+                "1. Analyze EACH paper in relation to the User's Query.\n"
+                "2. For EACH paper, structure your output EXACTLY as follows:\n"
+                "   - Start the section for each paper with 'Paper X:' (e.g., 'Paper 1:', 'Paper 2:').\n"
+                "   - On the next line, provide '**Title:**' followed by the exact title of the paper.\n"
+                "   - On the next line, provide '**Authors:**' followed by the list of authors.\n"
+                "   - On the next line, provide '**ArXiv ID:**' followed by the ArXiv ID.\n"
+                "   - On the next line, provide '**Summary:**' followed by YOUR 2-4 sentence summary of the paper's given abstract, focusing on its relevance to THE USER'S QUERY. Do NOT simply repeat the abstract. State if the paper seems irrelevant.\n\n"
+                "CRITICAL FORMATTING RULES:\n"
+                "- **DO NOT** include the '---GROUP_SEPARATOR---' line anywhere in your output. It is an input marker only and MUST NOT be part of your response.\n"
+                "- **DO NOT** use any other numbered lists (e.g., 1., 2.) or bulleted lists (e.g., -, *) for the Title, Authors, ArXiv ID, or Summary details within each paper's section.\n"
+                "- Each piece of information (Paper X:, Title, Authors, ArXiv ID, Summary) MUST start on a new line.\n"
+                "- Use the exact bolded labels ('**Title:**', '**Authors:**', '**ArXiv ID:**', '**Summary:**') as shown.\n\n"
+                "EXAMPLE OF OUTPUT FOR ONE PAPER:\n"
+                "Paper 1:\n"
+                "**Title:** Example Research Paper Title\n"
+                "**Authors:** A. N. Other, E. X. Ample\n"
+                "**ArXiv ID:** 2401.00001\n"
+                "**Summary:** This paper explores innovative methods in Y and is highly relevant to the user's query about Z because it directly addresses Q.\n\n"
+                "Now, begin your analysis, starting with Paper 1.\n"
+                "<end_of_turn>\\\n<start_of_turn>model\\\n"
+                "Okay, here is my analysis of the papers based on your query:"
+            )
             prompt_for_gemma = "".join(parts)
             generation_params = {"temperature": AppConfig.LLAMA_TEMPERATURE, "top_p": AppConfig.LLAMA_TOP_P, "max_tokens": AppConfig.LLAMA_MAX_TOKENS}
             logger.info(f"Using paper query params: {generation_params}")
