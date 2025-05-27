@@ -125,8 +125,12 @@
             </div>
 
             <footer class="chat-input-footer">
+                <div id="imagePreviewArea" class="image-preview-area" style="display: none;">
+                    <!-- Image thumbnail and remove button will be added here by JavaScript -->
+                </div>
                 <div class="chat-input-area">
-                    <button class="input-icon-btn"><i class="fas fa-paperclip"></i></button> <!-- Attachment icon -->
+                    <input type="file" id="imageUpload" accept="image/*" style="display: none;"> <!-- Hidden file input -->
+                    <button id="attachFileBtn" class="input-icon-btn"><i class="fas fa-paperclip"></i></button> <!-- Changed ID for clarity -->
                     <textarea id="userInput" placeholder="Type your prompt here..."></textarea>
                     <button id="sendButton" class="send-btn">
                         <!-- <i class="fas fa-arrow-up"></i> -->

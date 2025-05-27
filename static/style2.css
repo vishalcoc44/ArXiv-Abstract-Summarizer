@@ -686,6 +686,46 @@ body {
     justify-content: center;
 }
 
+/* Image Preview Area Styles */
+.image-preview-area {
+    display: flex; /* Use flex to align items */
+    align-items: center; /* Vertically center items */
+    padding: 8px;
+    margin-bottom: 8px; /* Space between preview and input bar */
+    background-color: var(--bg-tertiary);
+    border-radius: var(--border-radius-main);
+    width: 100%;
+    max-width: 700px; /* Match input area width */
+    position: relative; /* For absolute positioning of remove button if needed */
+}
+
+.image-preview-area img {
+    max-width: 80px; /* Limit thumbnail width */
+    max-height: 80px; /* Limit thumbnail height */
+    border-radius: 4px;
+    margin-right: 10px;
+    object-fit: cover;
+}
+
+.image-preview-area .remove-image-btn {
+    background: rgba(0,0,0,0.5);
+    color: white;
+    border: none;
+    border-radius: 50%;
+    width: 20px;
+    height: 20px;
+    font-size: 12px;
+    line-height: 20px; /* Center the 'X' */
+    text-align: center;
+    cursor: pointer;
+    margin-left: auto; /* Push to the right */
+    transition: background-color 0.2s ease;
+}
+
+.image-preview-area .remove-image-btn:hover {
+    background: rgba(0,0,0,0.7);
+}
+
 .chat-input-area {
     display: flex;
     align-items: center; /* Align items vertically, esp. for multiline textarea */

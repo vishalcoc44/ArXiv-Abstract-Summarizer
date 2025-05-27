@@ -217,6 +217,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const chatOutput = document.getElementById('chat-output');
     const userInput = document.getElementById('userInput');
     const sendButton = document.getElementById('sendButton');
+    const attachFileBtn = document.getElementById('attachFileBtn'); // Get the attach button
+    const imageUploadInput = document.getElementById('imageUpload'); // Get the hidden file input
     const mainContentTitle = document.querySelector('.initial-prompt-area h1'); 
     const suggestionCards = document.querySelectorAll('.suggestion-cards .card');
     const chatHeaderTitleElement = document.querySelector('.chat-header .current-chat-name h2');
@@ -224,6 +226,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const clearAllChatsBtn = document.getElementById('clear-all-chats-btn'); // Added clear all chats button
 
     let currentActiveChatId = null; // To store the ID of the currently active chat
+    let selectedImageData = null; // To store { data: base64, type: mimeType, name: fileName }
+    const imagePreviewArea = document.getElementById('imagePreviewArea'); // Get the preview area
 
     // --- GSAP Initial Load Animations ---
     const pageLoadTl = gsap.timeline({ defaults: { ease: 'expo.out', duration: 0.7 } });
@@ -344,10 +348,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // sendButton.addEventListener('mouseenter', () => sendButtonHoverTl.play());
     // sendButton.addEventListener('mouseleave', () => sendButtonHoverTl.reverse());
 
-    sendButton.addEventListener('click', () => {
-        // The visual change to sending icon will happen in handleSendMessage/proceedWithSending
-        handleSendMessage();
-    });
+    sendButton.addEventListener('click', handleSendMessage);
 
     // --- User Input Focus Animation ---
     userInput.addEventListener('focus', () => {
@@ -425,12 +426,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function handleSendMessage() {
+        console.log("[DEBUG] handleSendMessage CALLED"); // Added log
         const messageText = userInput.value.trim();
         if (messageText === '') return;
 
         if (!currentActiveChatId) {
             // If no chat is active, implicitly create a new one without prompting for a name.
-            console.log("No active chat. Attempting to create a new one silently.");
+            console.log("[DEBUG] No active chat. Attempting to create a new one silently."); // Added log
             // Use the first part of the message as a potential title, or default to "New Chat"
             const firstMessagePart = messageText.substring(0, 30); // Take first 30 chars for a potential title
             const defaultTitle = firstMessagePart + (messageText.length > 30 ? "..." : "") || "New Chat";
@@ -440,6 +442,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if(newChatInfo && newChatInfo.id) {
                         currentActiveChatId = newChatInfo.id; 
                         updateChatHeaderTitle(newChatInfo.title); // Update header with actual title used
+                        console.log("[DEBUG] New chat created, NOW calling proceedWithSending from handleSendMessage"); // Added log
                         proceedWithSending(messageText); // Now send the original message
                     } else {
                         appendMessage("Could not start a new chat. Please try again.", "bot-message");
@@ -447,6 +450,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             return; 
         }
+        console.log("[DEBUG] Active chat exists, calling proceedWithSending from handleSendMessage"); // Added log
         proceedWithSending(messageText);
     }
 
@@ -455,6 +459,7 @@ document.addEventListener('DOMContentLoaded', () => {
         userInput.value = '';
         userInput.style.height = 'auto'; 
         sendButton.classList.remove('active'); 
+        clearSelectedImage(); // Clear image preview and data as soon as message is sent from UI
         userInput.focus();
 
         if (initialPromptArea && getComputedStyle(initialPromptArea).display !== 'none') {
@@ -474,6 +479,10 @@ document.addEventListener('DOMContentLoaded', () => {
             model_type: currentModel,
             chat_id: currentActiveChatId
         };
+
+        if (selectedImageData) {
+            payload.image_data = selectedImageData; // Add image data to payload
+        }
 
         // Change send button to sending state (FontAwesome)
         const sendButtonIconContainer = document.getElementById('lottie-send-button-icon');
@@ -511,6 +520,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (done) {
                         console.log('Stream complete');
                         if(thinkingDots) thinkingDots.style.display = 'none';
+                        clearSelectedImage(); // Clear image after successful stream completion
 
                         // Add copy button for the completed bot message if text was received
                         if (accumulatedText.trim() !== '' && botMessageWrapper) {
@@ -586,6 +596,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     console.error('Error reading stream:', error);
                     if(thinkingDots) thinkingDots.style.display = 'none';
                     if (botMessageParagraph) botMessageParagraph.innerHTML += `<br><span class="error-text">Stream error: ${error.message}</span>`;
+                    clearSelectedImage(); // Also clear image on stream error
                     // Re-enable send button and set icon on error too
                     if (sendButtonIconContainer) {
                         sendButtonIconContainer.innerHTML = '<i class="fas fa-paper-plane"></i>'; 
@@ -602,6 +613,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // Update the placeholder message with error
             if (botMessageParagraph) botMessageParagraph.innerHTML = `<span class="error-text">Error: ${error.message}</span>`;
             botMessageWrapper.classList.remove('bot-thinking');
+            clearSelectedImage(); // Clear selected image on fetch error too
             // Re-enable send button and set icon
             if (sendButtonIconContainer) {
                 sendButtonIconContainer.innerHTML = '<i class="fas fa-paper-plane"></i>';
@@ -1941,6 +1953,76 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
         });
+    }
+
+    // --- EVENT LISTENERS --- 
+
+    if (attachFileBtn && imageUploadInput) {
+        attachFileBtn.addEventListener('click', () => {
+            imageUploadInput.click(); // Trigger click on the hidden file input
+        });
+
+        imageUploadInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file && file.type.startsWith('image/')) {
+                console.log('Image selected:', file.name, file.type, file.size);
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    selectedImageData = { data: e.target.result, type: file.type, name: file.name };
+                    displayImagePreview(selectedImageData.data);
+                };
+                reader.onerror = (e) => {
+                    console.error("FileReader error: ", e);
+                    alert("Error reading file.");
+                    clearSelectedImage();
+                };
+                reader.readAsDataURL(file);
+            } else if (file) {
+                alert("Please select an image file.");
+                selectedImageData = null; // Clear any previous selection
+                displayImagePreview(null); // Clear preview
+            }
+            imageUploadInput.value = null; // Reset input to allow re-selection of the same file
+        });
+    }
+
+    function displayImagePreview(imageDataUrl) {
+        if (!imagePreviewArea) return;
+
+        if (imageDataUrl) {
+            imagePreviewArea.innerHTML = `
+                <img src="${imageDataUrl}" alt="Selected image preview">
+                <button class="remove-image-btn" title="Remove image">&times;</button>
+            `;
+            imagePreviewArea.style.display = 'flex';
+            const removeBtn = imagePreviewArea.querySelector('.remove-image-btn');
+            if (removeBtn) {
+                removeBtn.addEventListener('click', clearSelectedImage);
+            }
+        } else {
+            imagePreviewArea.innerHTML = '';
+            imagePreviewArea.style.display = 'none';
+        }
+    }
+
+    function clearSelectedImage() {
+        console.log("clearSelectedImage CALLED");
+        console.trace(); // Log the call stack
+        console.log("imagePreviewArea before clearing:", imagePreviewArea);
+
+        selectedImageData = null;
+        if (imageUploadInput) imageUploadInput.value = null; // Ensure file input is also cleared
+        
+        // Directly hide and clear the preview area
+        if (imagePreviewArea) {
+            imagePreviewArea.innerHTML = '';
+            imagePreviewArea.style.display = 'none';
+            console.log("imagePreviewArea.style.display AFTER setting to none:", imagePreviewArea.style.display);
+            console.log("getComputedStyle(imagePreviewArea).display AFTER setting to none:", getComputedStyle(imagePreviewArea).display);
+        } else {
+            console.warn('[DEBUG] imagePreviewArea element not found in clearSelectedImage');
+        }
+        console.log("clearSelectedImage FINISHED"); // Added log
     }
 
 });
