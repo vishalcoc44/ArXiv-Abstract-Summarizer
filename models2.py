@@ -387,6 +387,7 @@ def load_category_faiss_index(category_key: str | None) -> FAISS | None:
 
 def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     overall_start_time = time.perf_counter() # Start overall timer
+    current_cancel_event = get_cancellation_event(chat_id) if chat_id else None # Initialize early
     DEBUG_SKIP_AUGMENTATION = False 
     DEBUG_SKIP_RAG_CONTEXT = False
     # DEBUG_SKIP_GEMINI_SUGGESTIONS = False # This flag is no longer relevant here
@@ -488,163 +489,236 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
     gemma_prompt_build_start_time = time.perf_counter() # General timer for prompt building
 
     if is_paper_query:
-        logger.info(f"Processing as a paper query. Will search local FAISS in category: '{category_key_for_faiss}'.")
+        logger.info(f"Processing as a paper query. New flow: LLM brainstorm -> FAISS verify -> LLM synthesize.")
+
+        # --- NEW Step 1: LLM Brainstorming for Revolutionary Papers ---
+        llm_candidate_papers = []
+        brainstorm_subject = "the relevant field" # Default
+        if extracted_subject_for_gemini_hint:
+            brainstorm_subject = extracted_subject_for_gemini_hint
+        elif category_key_for_faiss and category_key_for_faiss != "uncategorized":
+            friendly_map = {
+                "cs": "Computer Science", "math": "Mathematics", "physics": "Physics",
+                "astro-ph": "Astrophysics", "cond-mat": "Condensed Matter Physics",
+                "stat": "Statistics", "q-bio": "Quantitative Biology", "q-fin": "Quantitative Finance",
+                "nlin": "Nonlinear Sciences", "gr-qc": "General Relativity and Quantum Cosmology",
+                "hep-th": "High Energy Physics - Theory", "quant-ph": "Quantum Physics"
+            }
+            brainstorm_subject = friendly_map.get(category_key_for_faiss, category_key_for_faiss.replace("_", " ").title())
         
-        # --- This entire block for Gemini suggestions is removed ---
-        # gemini_arxiv_papers_info = []
-        # if not DEBUG_SKIP_GEMINI_SUGGESTIONS and systems_status["gemini_model_configured"]:
-        #    ... (Gemini call and processing) ...
-        # if gemini_arxiv_papers_info:
-        #    ... (Looping through Gemini suggestions and trying to match in FAISS) ...
-        # papers_for_gemma_synthesis.append(paper_data_for_gemma) 
-        # --- End of removed Gemini block ---
+        logger.info(f"Paper Query: Initiating LLM brainstorming for revolutionary papers in '{brainstorm_subject}'.")
 
-        # New: Directly search local FAISS for relevant papers
-        retrieved_context_docs_for_papers = []
-        if not DEBUG_SKIP_RAG_CONTEXT and systems_status["faiss_base_path_exists"]:
-            current_faiss_index_to_use = load_category_faiss_index(category_key_for_faiss)
-            if current_faiss_index_to_use:
-                # Determine how many docs to retrieve. More than requested to give LLM a choice.
-                k_for_faiss_search = num_papers_requested + 1 # Further reduced k
-                k_for_faiss_search = min(max(k_for_faiss_search, 5), 15) # Ensure it's sensible (e.g., min 5, max 15)
+        prompt_for_brainstorming_parts = [
+            "<start_of_turn>user",
+            f"You are an AI assistant with broad knowledge of scientific literature.",
+            f"I am looking for top-tier, revolutionary, and potentially 'world-changing' research paper titles in the field of **{brainstorm_subject}**.",
+            f"Based on your general training data, please list up to 10-15 highly influential research paper **TITLES ONLY**.",
+            f"**IMPORTANT INSTRUCTIONS FOR THE LIST:**",
+            f"1. Each paper title **MUST** be on its own new line.",
+            f"2. Do **NOT** include authors.",
+            f"3. Do **NOT** include any numbering (e.g., 1., 2.) or bullet points (e.g., -, *).",
+            f"4. Do **NOT** include any introductory text like 'Here is the list:' or any summary/concluding text after the list.",
+            f"5. Just output the raw titles, each on a new line, and nothing else.",
+            "<end_of_turn>",
+            "<start_of_turn>model" # Model should directly start with the first title on a new line
+            # f"Okay, here are the titles, each on a new line:" # Removed even this preamble for the model
+        ]
+        prompt_for_brainstorming = "\\n".join(prompt_for_brainstorming_parts)
+        
+        brainstorm_params = {
+            "temperature": min(AppConfig.LLAMA_TEMPERATURE + 0.20, 0.9), # Higher temp for brainstorming
+            "top_p": AppConfig.LLAMA_TOP_P,
+            "max_tokens": 700 # Increased for potentially longer list of titles/authors
+        }
+
+        brainstorm_llm_call_start_time = time.perf_counter()
+        brainstormed_text_full = ""
+        try:
+            logger.info(f"Calling LLM for brainstorming paper titles in {brainstorm_subject} with temp {brainstorm_params['temperature']}.")
+            
+            brainstorm_response_stream = local_llm.create_chat_completion_openai_v1(
+                messages=[{"role": "user", "content": prompt_for_brainstorming}],
+                stream=True,
+                temperature=brainstorm_params["temperature"],
+                top_p=brainstorm_params["top_p"],
+                max_tokens=brainstorm_params["max_tokens"]
+            )
+            
+            for chunk in brainstorm_response_stream:
+                if current_cancel_event and current_cancel_event.is_set():
+                    logger.info(f"Cancellation event detected during LLM brainstorming for chat_id {chat_id}.")
+                    raise Exception("LLM Brainstorming Cancelled") 
+
+                delta_content = chunk.choices[0].delta.content
+                if delta_content:
+                    brainstormed_text_full += delta_content
+            
+            brainstorm_llm_call_duration = time.perf_counter() - brainstorm_llm_call_start_time
+            logger.info(f"[PERF] LLM brainstorming call took: {brainstorm_llm_call_duration:.4f} seconds. Response length: {len(brainstormed_text_full)}")
+            logger.debug(f"LLM Brainstormed Text for {brainstorm_subject}:\\n{brainstormed_text_full}")
+
+            # Parse brainstormed_text_full - simplified for titles only, one per line
+            raw_lines = [line.strip() for line in brainstormed_text_full.split('\\n') if line.strip()]
+            for line_idx, line in enumerate(raw_lines):
+                title = line.strip() # Each line is now considered a potential title
                 
-                logger.info(f"Searching FAISS category '{category_key_for_faiss}' for '{actual_user_question}' with k={k_for_faiss_search}")
-                rag_faiss_search_start_time = time.perf_counter()
-                try:
-                    docs_with_scores = current_faiss_index_to_use.similarity_search_with_score(
-                        actual_user_question, 
-                        k=k_for_faiss_search
-                    )
-                    rag_faiss_search_duration = time.perf_counter() - rag_faiss_search_start_time
-                    logger.info(f"[PERF] Local FAISS paper search (k={k_for_faiss_search}) in category '{category_key_for_faiss}' took: {rag_faiss_search_duration:.4f} seconds.")
-
-                    if docs_with_scores:
-                        # Filter by score if needed, or take top N directly
-                        # For now, let's take all retrieved up to k_for_faiss_search for LLM to process
-                        # relevant_docs = [doc for doc, score in docs_with_scores if score < 0.85] # Example score filter
-                        retrieved_context_docs_for_papers = [doc for doc, score in docs_with_scores] # Taking all
-                        logger.info(f"Retrieved {len(retrieved_context_docs_for_papers)} documents from FAISS for paper query.")
-                        
-                        # --- Added Logging for FAISS output ---
-                        logger.info(f"--- Top FAISS results for query '{actual_user_question}' in category '{category_key_for_faiss}' (before Gemma processing) ---")
-                        for i_doc, doc_retrieved in enumerate(retrieved_context_docs_for_papers):
-                            doc_title = doc_retrieved.metadata.get('title', 'N/A Title')
-                            doc_abstract_snippet = doc_retrieved.metadata.get('abstract', doc_retrieved.page_content or '')[:150]
-                            logger.info(f"FAISS Doc {i_doc+1}: Title: {doc_title} | Abstract Snippet: {doc_abstract_snippet}...")
-                        logger.info("--- End of FAISS results log ---")
-                        # --- End of Added Logging ---
-
-                    else:
-                        logger.info(f"No documents returned from FAISS search for paper query in category '{category_key_for_faiss}'.")
-                except Exception as e_local_faiss_paper_search:
-                    logger.error(f"Error during local FAISS paper search in category '{category_key_for_faiss}': {e_local_faiss_paper_search}", exc_info=True)
+                if title and len(title) > 5: # Basic filter for very short/empty lines and ensure some substance
+                     llm_candidate_papers.append({"title": title, "authors_suggestion": ""}) # No authors from brainstorm
+                # else: # Debugging if a line is skipped
+                #    logger.debug(f"Skipping potential title line (too short or empty): '{title}'")
+            
+            if llm_candidate_papers:
+                logger.info(f"LLM brainstormed {len(llm_candidate_papers)} candidate paper titles for {brainstorm_subject}.")
             else:
-                logger.warning(f"FAISS index for category '{category_key_for_faiss}' could not be loaded for paper query.")
-        elif DEBUG_SKIP_RAG_CONTEXT:
-            logger.info("DEBUG_SKIP_RAG_CONTEXT is true. Skipping FAISS search for paper query.")
+                logger.warning(f"LLM brainstorming did not yield any parseable paper titles for {brainstorm_subject} from raw text: {brainstormed_text_full}")
+
+        except Exception as e_brainstorm:
+            logger.error(f"Error during LLM brainstorming call for {brainstorm_subject}: {e_brainstorm}", exc_info=True)
+            if "Cancelled" not in str(e_brainstorm): 
+                 yield f"An error occurred while trying to brainstorm papers: {str(e_brainstorm)}"
         
-        # Populate papers_for_gemma_synthesis directly from FAISS results
-        if retrieved_context_docs_for_papers:
-            for doc in retrieved_context_docs_for_papers:
-                # Extract metadata. Ensure keys exist or provide defaults.
-                title = doc.metadata.get("title", "N/A Title").strip()
-                authors_list = doc.metadata.get("authors", [])
-                if isinstance(authors_list, str): # If authors is a string, try to split
-                    authors = [a.strip() for a in authors_list.split(',') if a.strip()]
-                elif isinstance(authors_list, list):
-                    authors = [str(a).strip() for a in authors_list if str(a).strip()]
-                else:
-                    authors = ["N/A"]
+        # --- MODIFIED Step 2: FAISS Verification & Augmentation ---
+        if llm_candidate_papers and not (current_cancel_event and current_cancel_event.is_set()):
+            logger.info(f"Verifying {len(llm_candidate_papers)} LLM-brainstormed papers against local FAISS in category '{category_key_for_faiss}'.")
+            current_faiss_index_to_use = load_category_faiss_index(category_key_for_faiss)
 
-                arxiv_id = doc.metadata.get("arxiv_id", "N/A").strip()
-                local_abstract_full = doc.metadata.get("abstract", doc.page_content if doc.page_content else "N/A").strip()
+            if current_faiss_index_to_use:
+                verified_faiss_doc_ids = set()
+
+                for candidate_idx, candidate_paper in enumerate(llm_candidate_papers):
+                    if current_cancel_event and current_cancel_event.is_set(): 
+                        break 
+                    candidate_title = candidate_paper["title"]
+                    search_query_for_faiss_verification = candidate_title
+                    
+                    try:
+                        docs_with_scores = current_faiss_index_to_use.similarity_search_with_score(
+                            search_query_for_faiss_verification, k=3 
+                        )
+
+                        if docs_with_scores:
+                            MAX_TITLE_LEN_FOR_LOG = 70
+                            for doc, score in docs_with_scores:
+                                if current_cancel_event and current_cancel_event.is_set(): 
+                                    break
+
+                                faiss_title = doc.metadata.get("title", "").strip()
+                                faiss_arxiv_id = doc.metadata.get("arxiv_id", "N/A")
+                                unique_doc_id_from_faiss = faiss_arxiv_id if faiss_arxiv_id != "N/A" else faiss_title
+
+                                title_similarity_threshold = 0.80
+                                is_similar_title = are_texts_semantically_similar(candidate_title, faiss_title, threshold=title_similarity_threshold)
+                                score_is_good = score < 0.8 
+
+                                log_candidate_title_short = candidate_title[:MAX_TITLE_LEN_FOR_LOG] + ('...' if len(candidate_title) > MAX_TITLE_LEN_FOR_LOG else '')
+                                log_faiss_title_short = faiss_title[:MAX_TITLE_LEN_FOR_LOG] + ('...' if len(faiss_title) > MAX_TITLE_LEN_FOR_LOG else '')
+
+                                if is_similar_title and score_is_good:
+                                    if unique_doc_id_from_faiss not in verified_faiss_doc_ids:
+                                        logger.info(f"  VERIFIED: LLM Candidate '{log_candidate_title_short}' matched FAISS doc '{log_faiss_title_short}' (ID: {faiss_arxiv_id}, Score: {score:.3f})")
+                                        
+                                        authors_list = doc.metadata.get("authors", [])
+                                        authors = [str(a).strip() for a in authors_list if str(a).strip()] if isinstance(authors_list, list) else ([a.strip() for a in authors_list.split(',')] if isinstance(authors_list, str) else ["N/A"])
+                                        local_abstract_full = doc.metadata.get("abstract", doc.page_content or "N/A").strip()
+                                        MAX_ABSTRACT_LEN_FOR_PROMPT = 600
+                                        local_abstract_truncated = (local_abstract_full[:MAX_ABSTRACT_LEN_FOR_PROMPT] + "... (truncated)") if len(local_abstract_full) > MAX_ABSTRACT_LEN_FOR_PROMPT else local_abstract_full
+
+                                        papers_for_gemma_synthesis.append({
+                                            "title": faiss_title, 
+                                            "authors": authors, "arxiv_id": faiss_arxiv_id,
+                                            "chosen_abstract": local_abstract_truncated,
+                                            "abstract_source": f"Local FAISS ({category_key_for_faiss}) - Verified LLM Suggestion"
+                                        })
+                                        verified_faiss_doc_ids.add(unique_doc_id_from_faiss)
+                                        break 
+                    except Exception as e_faiss_verify:
+                        logger.error(f"Error verifying LLM candidate '{candidate_title}' in FAISS: {e_faiss_verify}", exc_info=True)
                 
-                # Truncate abstract for Gemma's context to reduce prompt size
-                MAX_ABSTRACT_LEN_FOR_PROMPT = 600 
-                if len(local_abstract_full) > MAX_ABSTRACT_LEN_FOR_PROMPT:
-                    local_abstract_truncated = local_abstract_full[:MAX_ABSTRACT_LEN_FOR_PROMPT] + "... (truncated)"
-                else:
-                    local_abstract_truncated = local_abstract_full
+                if papers_for_gemma_synthesis:
+                    logger.info(f"Successfully verified and retrieved {len(papers_for_gemma_synthesis)} papers from FAISS based on LLM brainstorming.")
+                else: 
+                    logger.warning(f"LLM brainstormed {len(llm_candidate_papers)} papers, but none could be confidently verified in the local FAISS index for category '{category_key_for_faiss}'.")
+            else: 
+                logger.warning(f"FAISS index for category '{category_key_for_faiss}' not loaded. Cannot verify LLM brainstormed papers.")
+        
+        # --- MODIFIED Step 3: LLM Synthesis or Inform User ---
+        if current_cancel_event and current_cancel_event.is_set():
+             prompt_for_gemma = "" 
+        elif papers_for_gemma_synthesis:
+            num_verified_papers = len(papers_for_gemma_synthesis)
+            current_subject_specific_guidance = (
+                f"Your task is to identify **truly groundbreaking, 'top-tier', or 'revolutionary' research articles** within {brainstorm_subject}. "
+                f"The user is looking for papers that likely had a **significant, transformative impact** on the field – papers that might be considered 'world-changing' within their specific domain. "
+                f"When evaluating the provided document summaries (we have {num_verified_papers} for you to consider), you must prioritize papers whose abstracts strongly suggest they: "
+                f"  - Introduced foundational or paradigm-shifting concepts. "
+                f"  - Solved major, long-standing open problems. "
+                f"  - Presented exceptionally novel methodologies or experimental results that opened up entirely new avenues of research. "
+                f"  - Have clear indications of widespread influence or have become cornerstone references (infer this from language suggesting broad applicability, fundamental breakthroughs, etc.). "
+                f"**Crucially, you MUST AVOID selecting:** "
+                f"- Standard research papers that report incremental advances, unless their abstract very strongly hints at broader, transformative implications. "
+                f"- General surveys, textbooks, broad overviews, collections, proceedings, bulletins, or regularly published series. "
+                f"- Papers primarily discussing history, bibliography, or minor technical improvements. "
+                f"If, after carefully reviewing these {num_verified_papers} document summaries, you cannot identify any papers whose abstracts strongly suggest such revolutionary impact, you should state that you couldn't find papers meeting this high bar from this list, rather than listing less impactful ones. "
+                f"Your selection must reflect what a domain expert might consider a landmark paper, based *solely* on the clues within the provided abstracts."
+            )
 
-                papers_for_gemma_synthesis.append({
-                    "title": title,
-                    "authors": authors,
-                    "arxiv_id": arxiv_id,
-                    "chosen_abstract": local_abstract_truncated, # Use truncated abstract for prompt
-                    "abstract_source": f"Local FAISS ({category_key_for_faiss})"
-                })
-            logger.info(f"Prepared {len(papers_for_gemma_synthesis)} papers from local FAISS for Gemma synthesis.")
-
-        if papers_for_gemma_synthesis:
-            # Construct prompt for Gemma to select and summarize N papers from the retrieved set
+            prompt_instruction_refined = (
+                f"You are an AI research assistant. The user asked for revolutionary papers in **{brainstorm_subject}**. "
+                f"We first used your general knowledge to suggest some potentially influential papers, and then found the following {num_verified_papers} of them in our local ArXiv database. "
+                f"From THIS LIST of {num_verified_papers} document summaries, please apply your strictest judgment to identify and present up to {num_papers_requested} that best exemplify **truly groundbreaking or revolutionary research** in {brainstorm_subject}. "
+                f"{current_subject_specific_guidance} "
+                f"For each selected paper, provide its Title, Authors, ArXiv ID, and a concise 2-4 sentence summary derived from its provided abstract, highlighting its key concepts or findings and explaining why it stands out as a revolutionary research paper from THIS LIST. "
+                f"If fewer than {num_papers_requested} papers from this list meet this extremely high bar for 'revolutionary', list only those that do. "
+                f"If none of these {num_verified_papers} papers from the list strongly convey revolutionary impact based on their abstracts, state that clearly."
+            )
+            
             context_papers_str_parts = []
             for i, p_data in enumerate(papers_for_gemma_synthesis):
                 context_papers_str_parts.append(
-                    f"Document {i+1} (Potential Paper):\n"
+                    f"Document {i+1} (From local DB, originally suggested by LLM):\n"
                     f"Title: {p_data['title']}\n"
-                    f"Authors: {', '.join(p_data['authors']) if p_data['authors'] else 'N/A'}\n"
+                    f"Authors: {', '.join(p_data['authors']) if p_data['authors'] and p_data['authors'][0] != 'N/A' else 'N/A'}\n"
                     f"ArXiv ID: {p_data['arxiv_id'] if p_data['arxiv_id'] else 'N/A'}\n"
                     f"Abstract:\n{p_data['chosen_abstract']}\n---"
                 )
             context_str = "\\n".join(context_papers_str_parts)
 
-            # Determine subject for prompt and specific guidance
-            subject_for_prompt_display = "relevant" # Default
-            subject_guidance_noun = "academic" # Default noun for guidance
-            
-            if extracted_subject_for_gemini_hint and extracted_subject_for_gemini_hint.lower() != "uncategorized":
-                subject_for_prompt_display = extracted_subject_for_gemini_hint.lower()
-                subject_guidance_noun = subject_for_prompt_display
-            elif category_key_for_faiss and category_key_for_faiss != "uncategorized":
-                subject_for_prompt_display = category_key_for_faiss.replace("_", " ").lower()
-                subject_guidance_noun = subject_for_prompt_display
-            
-            subject_specific_guidance = (
-                f"Prioritize papers presenting direct research in {subject_guidance_noun} "
-                f"(e.g., specific theories, experimental results, new algorithms, models, or analyses within {subject_guidance_noun}) "
-                f"over general surveys, textbooks, bibliometric studies, or collections (like 'Selected Papers', 'Proceedings', 'Bulletins', 'This Week\'s Finds'), "
-                f"unless these collections themselves are the explicit subject of the query or the abstract clearly indicates a specific, citable research contribution directly relevant to the user's query. "
-                f"The user is looking for substantive research contributions, not just any document that mentions '{subject_guidance_noun}'. "
-                f"Pay close attention to the titles of the documents; titles like 'Bulletin', 'Selected Works', 'Weekly Finds', or overly broad titles (e.g., 'Graph Theory' as a standalone title for a research paper query) are often indicators that the document might not be a specific research paper but rather a collection, periodical, or textbook chapter. Filter these out unless the abstract clearly indicates a specific, citable research contribution highly relevant to the user's query. "
-            )
-
-            prompt_instruction = (
-                f"You are an AI research assistant. Based on the user's query and the following retrieved academic document summaries from our local ArXiv database, "
-                f"please identify and present up to {num_papers_requested} of the most relevant **{subject_for_prompt_display} research papers that discuss specific {subject_for_prompt_display} topics or findings.** "
-                f"{subject_specific_guidance} "
-                f"For each selected paper, provide its Title, Authors, ArXiv ID, and a concise 2-4 sentence summary derived from its provided abstract, highlighting its **key {subject_for_prompt_display} concepts or findings** and explaining why it's a relevant {subject_for_prompt_display} research paper in the context of the user's query. "
-                f"If fewer than {num_papers_requested} relevant {subject_for_prompt_display} papers are found in the provided context, list only those that are relevant. "
-                f"If no relevant {subject_for_prompt_display} papers are found in the context, state that clearly. Do not make up papers or information not present in the provided document summaries."
-            )
-
             parts = [
                 f"{conversation_log_str_for_gemma}",
                 f"<start_of_turn>user",
-                f"{prompt_instruction}",
-                f"\\nUSER'S QUERY:\\n---\\n{actual_user_question}\\n---",
-                f"\\nCONTEXT DOCUMENT SUMMARIES:\\n===\\n{context_str}\\n===",
+                f"{prompt_instruction_refined}",
+                f"\\nUSER'S ORIGINAL QUERY (for context):\\n---\\n{actual_user_question}\\n---", 
+                f"\\nCONTEXT DOCUMENT SUMMARIES (LLM-suggested, verified in local DB):\\n===\\n{context_str}\\n===",
                 f"Please begin your response now, presenting the papers as requested.",
                 f"<end_of_turn>",
                 f"<start_of_turn>model",
-                f"Okay, I will analyze the provided document summaries and select up to {num_papers_requested} relevant papers for your query: '{actual_user_question}'." 
-                # The model should then list them out.
+                f"Okay, I will analyze the {num_verified_papers} provided document summaries (which were suggested by an AI and found in your local database) and select up to {num_papers_requested} that I judge to be the most revolutionary for your query: '{actual_user_question}'."
             ]
             prompt_for_gemma = "\\n".join(parts)
-            generation_params = {"temperature": AppConfig.LLAMA_TEMPERATURE, "top_p": AppConfig.LLAMA_TOP_P, "max_tokens": AppConfig.LLAMA_MAX_TOKENS} # Potentially allow more tokens for summarization
-            logger.info(f"Using paper query params (local FAISS only): {generation_params}")
-            logger.debug(f"Gemma prompt for local paper synthesis (first 500 chars): {prompt_for_gemma[:500]}...")
-        else: # No papers retrieved from FAISS or DEBUG_SKIP_RAG_CONTEXT
-            logger.info(f"No papers retrieved from FAISS for category '{category_key_for_faiss}' to synthesize for the paper query. Proceeding to general RAG or direct response.")
-            # This will naturally fall through to the next 'if not papers_for_gemma_synthesis ...' block
-            # which handles general RAG or direct response.
-            # We set prompt_for_gemma to empty here to ensure it falls through if is_paper_query was true but no papers found.
-            prompt_for_gemma = ""
+            paper_query_temperature = min(AppConfig.LLAMA_TEMPERATURE + 0.15, 0.85)
+            generation_params = {
+                "temperature": paper_query_temperature, "top_p": AppConfig.LLAMA_TOP_P,
+                "max_tokens": AppConfig.LLAMA_MAX_TOKENS 
+            }
+            logger.info(f"Using paper query params (LLM-first flow, {num_verified_papers} candidates): {generation_params}")
+            logger.debug(f"Gemma prompt for LLM-first paper synthesis (first 500 chars): {prompt_for_gemma[:500]}...")
 
-            
-    # General RAG or fallback if paper query yielded no specific papers to synthesize (and not DEBUG_SKIP_AUGMENTATION)
-    # This block will also be hit if is_paper_query was true but papers_for_gemma_synthesis remained empty.
-    if not prompt_for_gemma and not DEBUG_SKIP_AUGMENTATION: # Check if prompt_for_gemma was set by paper query block
-        logger.info("Proceeding with general RAG / direct response flow (either not a paper query, or paper query found no local docs).")
+        else: 
+            if not (current_cancel_event and current_cancel_event.is_set()): 
+                if not llm_candidate_papers : 
+                    message = f"I attempted to identify revolutionary papers in {brainstorm_subject} based on general knowledge to check against your local database, but I couldn't generate a reliable candidate list. You could try rephrasing your request."
+                    logger.warning(message)
+                    yield message
+                else: 
+                    message = (f"I identified some potentially influential papers in {brainstorm_subject} based on general knowledge, "
+                               f"but unfortunately, I could not find them in your local ArXiv database for the category '{category_key_for_faiss}'. "
+                               "Therefore, I cannot list top papers from your local data using that approach.")
+                    logger.warning(message)
+                    yield message
+            prompt_for_gemma = "" 
+    
+    elif not prompt_for_gemma and not DEBUG_SKIP_AUGMENTATION: 
+        logger.info("Proceeding with general RAG / direct response flow (not a paper query, or paper query failed appropriately).")
         context_docs = []
         
         # The category_key_for_faiss is already determined based on the user query earlier.
@@ -713,7 +787,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
         logger.info(f"[PERF] Total generate_local_rag_response execution time (aborted): {overall_duration:.4f} seconds.")
         return
 
-    current_cancel_event = get_cancellation_event(chat_id) if chat_id else None
+    # current_cancel_event = get_cancellation_event(chat_id) if chat_id else None # MOVED TO TOP
     accumulated_response = ""
     llm_call_start_time = time.perf_counter()
     try:
