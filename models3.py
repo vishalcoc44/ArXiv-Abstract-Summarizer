@@ -12,7 +12,7 @@ import tensorrt_llm.runtime
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from config import AppConfig
+from config3 import AppConfig
 
 logger = logging.getLogger(__name__)
 

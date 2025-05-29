@@ -663,13 +663,17 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
             )
 
             prompt_instruction_refined = (
-                f"You are an AI research assistant. The user asked for revolutionary papers in **{brainstorm_subject}**. "
-                f"We first used your general knowledge to suggest some potentially influential papers, and then found the following {num_verified_papers} of them in our local ArXiv database. "
-                f"From THIS LIST of {num_verified_papers} document summaries, please apply your strictest judgment to identify and present up to {num_papers_requested} that best exemplify **truly groundbreaking or revolutionary research** in {brainstorm_subject}. "
+                f"You are an AI research assistant. The user asked for **papers related to {brainstorm_subject}** and specified they want **exactly {num_papers_requested} papers** (or fewer, if not enough high-quality papers are found from the provided list). "
+                f"We have provided you with {num_verified_papers} document summaries that were initially suggested by an AI and then found in our local ArXiv database. "
+                f"Your task is to critically evaluate these {num_verified_papers} summaries and select **EXACTLY {num_papers_requested} papers IF {num_papers_requested} papers meet the 'revolutionary' criteria described below.** "
+                f"If you find fewer than {num_papers_requested} papers that meet the 'revolutionary' criteria, list only those that meet this high bar. "
+                f"**IT IS CRITICAL: UNDER NO CIRCUMSTANCES should you list MORE THAN {num_papers_requested} papers, even if you find many good ones.** "
+                f"If you identify more than {num_papers_requested} revolutionary papers from the provided list, you MUST select only the top {num_papers_requested} most impactful ones and discard the rest. Do not mention any discarded papers or the fact that you discarded some. Your final list must contain {num_papers_requested} or fewer entries."
                 f"{current_subject_specific_guidance} "
-                f"For each selected paper, provide its Title, Authors, ArXiv ID, and a concise 2-4 sentence summary derived from its provided abstract, highlighting its key concepts or findings and explaining why it stands out as a revolutionary research paper from THIS LIST. "
-                f"If fewer than {num_papers_requested} papers from this list meet this extremely high bar for 'revolutionary', list only those that do. "
-                f"If none of these {num_verified_papers} papers from the list strongly convey revolutionary impact based on their abstracts, state that clearly."
+                f"For each selected paper (strictly {num_papers_requested} or fewer as per the rules above): provide its Title, Authors, ArXiv ID, and a concise 2-4 sentence summary derived from its provided abstract, highlighting its key concepts or findings and explaining why it stands out as a revolutionary research paper from THIS LIST. "
+                f"**Begin your response directly with a sentence like: 'Okay, based on the abstracts, here are {num_papers_requested} papers...' or 'Okay, based on the abstracts, I found X papers...' where X is the actual number you are presenting (which must be {num_papers_requested} or less).** Do not add any other preamble before this sentence."
+                f"If, after careful review, none of these {num_verified_papers} papers from the list strongly convey revolutionary impact according to the criteria, state that clearly (e.g., 'After reviewing the provided abstracts, I could not identify any that meet the high bar for revolutionary research in {brainstorm_subject}.') and do not list any papers."
+                f"Your final output list must contain **exactly {num_papers_requested} entries if that many meet the criteria, or fewer if not, but absolutely no more than {num_papers_requested} entries.** Now, generate your response."
             )
             
             context_papers_str_parts = []
@@ -692,7 +696,7 @@ def generate_local_rag_response(user_query_with_history: str, chat_id=None):
                 f"Please begin your response now, presenting the papers as requested.",
                 f"<end_of_turn>",
                 f"<start_of_turn>model",
-                f"Okay, I will analyze the {num_verified_papers} provided document summaries (which were suggested by an AI and found in your local database) and select up to {num_papers_requested} that I judge to be the most revolutionary for your query: '{actual_user_question}'."
+                f"Understood. I will now generate the paper list, strictly adhering to all instructions provided in the user's request, especially regarding the exact number of papers."
             ]
             prompt_for_gemma = "\\n".join(parts)
             paper_query_temperature = min(AppConfig.LLAMA_TEMPERATURE + 0.15, 0.85)
